@@ -20,7 +20,7 @@ Use **Python 3.10+**. Agent CLIs are needed for delegated work and CLI delivery;
 mailbox messaging only needs connected MCP clients.
 
 ```sh
-git clone <this-fork-url> hardline-mcp
+git clone https://github.com/Akyltist/Hardline-Relay.git hardline-mcp
 cd hardline-mcp
 python -m venv .venv
 ```
