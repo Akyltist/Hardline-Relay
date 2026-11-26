@@ -34,6 +34,7 @@ def test_announcer_to_fake_dsh_host_preserves_receipt_and_coalesces_retry(monkey
             monkeypatch.setenv("HARDLINE_DSH_WAKE_URL", address)
             monkeypatch.setenv("HARDLINE_DSH_WAKE_TOKEN", env["TEST_NOTICE_SECRET"])
             monkeypatch.setenv("HARDLINE_DSH_CLIENT_NAME", "dsh-mcp-client")
+            monkeypatch.setenv("HARDLINE_DSH_WAKE_ROUTE", "test-route")
             monkeypatch.setenv("HARDLINE_AGENT", "codex")
             wake = dsh_wake.from_env()
             text = wake.notice("0123456789abcdef")

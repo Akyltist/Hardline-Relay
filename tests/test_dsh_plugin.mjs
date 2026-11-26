@@ -4,8 +4,8 @@ import { test } from 'node:test';
 import { startNoticeServer } from '../experiments/dsh_plugin/core.mjs';
 
 const secret = randomBytes(32).toString('hex');
-const config = { sessionId: 'isolated-test-session', agent: 'codex:berlin-test', secret, port: 0 };
-const valid = { nonce: '0123456789abcdef' };
+const config = { sessionId: 'isolated-test-session', agent: 'codex', route: 'test-route', secret, port: 0 };
+const valid = { nonce: '0123456789abcdef', agent: 'codex', route: 'test-route' };
 
 async function fixture(followup = () => {}, options = {}) {
   const lookedUp = [];
@@ -31,7 +31,7 @@ test('only loopback listens and valid request reaches only configured session', 
   assert.equal(f.messages[0].source.kind, 'hardline');
   assert.equal(f.messages[0].source.form, 'notice');
   assert.equal(f.messages[0].role, 'user');
-  assert.match(f.messages[0].content[0].text, /codex:berlin-test/);
+  assert.match(f.messages[0].content[0].text, /inbox\(agent='codex'/);
   assert.match(f.messages[0].content[0].text, /0123456789abcdef/);
   assert.match(f.messages[0].content[0].text, /auto_ack=false/);
   assert.match(f.messages[0].content[0].text, /receipt='0123456789abcdef'/);
@@ -68,6 +68,17 @@ test('unknown live target is not resumed and is rejected', async t => {
   assert.deepEqual(f.lookedUp, [config.sessionId]);
 });
 
+test('different route or agent cannot wake this session', async t => {
+  const f = await fixture();
+  t.after(() => f.service.close());
+  assert.equal((await f.send({ ...valid, route: 'other-route' })).status, 403);
+  assert.equal((await f.send({ ...valid, agent: 'claude' })).status, 403);
+  assert.deepEqual(f.lookedUp, []);
+  assert.equal(f.messages.length, 0);
+  assert.equal((await f.send()).status, 202);
+  assert.equal(f.messages.length, 1);
+});
+
 test('followup errors and uncertain async acceptance return 500', async t => {
   const f = await fixture(async () => { throw new Error('private detail'); });
   t.after(() => f.service.close());
@@ -86,7 +97,7 @@ test('close shuts down listening endpoint', async () => {
 });
 
 test('refuses missing or invalid config before listening', async () => {
-  for (const patch of [{ secret: 'short' }, { sessionId: '' }, { agent: 'agent\ntext' }, { port: -1 }]) {
+  for (const patch of [{ secret: 'short' }, { sessionId: '' }, { agent: 'codex:other' }, { route: '' }, { route: 'bad route' }, { port: -1 }]) {
     await assert.rejects(startNoticeServer({ ctx: { agents: { get() {} } }, config: { ...config, ...patch }, createUserMessage: x => x }), TypeError);
   }
 });

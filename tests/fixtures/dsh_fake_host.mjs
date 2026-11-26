@@ -8,7 +8,7 @@ const ctx = { agents: { get(id) {
 } } };
 const service = await startNoticeServer({
   ctx,
-  config: { sessionId: 'test-session', agent: process.env.TEST_NOTICE_AGENT ?? 'codex:berlin-test',
+  config: { sessionId: 'test-session', agent: process.env.TEST_NOTICE_AGENT ?? 'codex', route: 'test-route',
             secret: process.env.TEST_NOTICE_SECRET, port: 0 },
   createUserMessage: value => ({ ...value, role: 'user' }),
 });

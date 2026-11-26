@@ -4,7 +4,9 @@
 > at commit `940ed055eed25f863048167a305ef3e6b17c0054`, distributed under the MIT
 > license in [LICENSE](LICENSE). The PostgreSQL/LAN and DeepSeek Harness wake
 > additions are research prototypes: they are not ready for production or LAN
-> exposure, and the DSH plugin has not been verified in a real session. See
+> exposure. The sender and a separate DSH pilot receiver were tested together in
+> a real DSH session with a test mailbox; the bundled receiver remains a
+> prototype and was tested with a simulated host. See
 > [experiments/README.md](experiments/README.md) and
 > [the DSH experiment](experiments/dsh_plugin/README.md) for limitations.
 > The standard Hardline behavior described below is inherited from upstream.

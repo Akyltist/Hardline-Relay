@@ -1,9 +1,10 @@
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 
-const MAX_BODY_BYTES = 128;
+const MAX_BODY_BYTES = 256;
 const NONCE = /^[0-9a-f]{16}$/;
-const AGENT = /^[a-zA-Z0-9_.:-]{1,64}$/;
+const AGENT = /^(codex|claude|hermes)$/;
+const ROUTE = /^[a-zA-Z0-9_.-]{1,64}$/;
 const SECRET = /^[a-f0-9]{64}$/;
 const RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_NOTICES = 1024;
@@ -13,9 +14,9 @@ export async function startNoticeServer({ ctx, config, createUserMessage }) {
   if (!ctx?.agents || typeof ctx.agents.get !== 'function' || typeof createUserMessage !== 'function') {
     throw new TypeError('Missing DSH agent registry or message factory');
   }
-  const { sessionId, agent, secret, port = 0 } = config ?? {};
+  const { sessionId, agent, route, secret, port = 0 } = config ?? {};
   if (typeof sessionId !== 'string' || !sessionId.trim() || sessionId.length > 128 ||
-      sessionId !== sessionId.trim() || !AGENT.test(agent ?? '') ||
+      sessionId !== sessionId.trim() || !AGENT.test(agent ?? '') || !ROUTE.test(route ?? '') ||
       !SECRET.test(secret ?? '') || !Number.isInteger(port) || port < 0 || port > 65535) {
     throw new TypeError('Invalid notice server configuration');
   }
@@ -42,8 +43,12 @@ export async function startNoticeServer({ ctx, config, createUserMessage }) {
       try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
       catch { return finish(400); }
       if (!payload || Array.isArray(payload) || typeof payload !== 'object' ||
-          Object.keys(payload).length !== 1 || !Object.hasOwn(payload, 'nonce') ||
-          typeof payload.nonce !== 'string' || !NONCE.test(payload.nonce)) return finish(400);
+          Object.keys(payload).length !== 3 || !Object.hasOwn(payload, 'nonce') ||
+          !Object.hasOwn(payload, 'agent') || !Object.hasOwn(payload, 'route') ||
+          typeof payload.nonce !== 'string' || !NONCE.test(payload.nonce) ||
+          typeof payload.agent !== 'string' || !AGENT.test(payload.agent) ||
+          typeof payload.route !== 'string' || !ROUTE.test(payload.route)) return finish(400);
+      if (payload.agent !== agent || payload.route !== route) return finish(403);
       if (!accepting) return finish(503);
       const now = Date.now();
       for (const [nonce, record] of notices) {

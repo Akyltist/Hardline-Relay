@@ -19,6 +19,7 @@ def config(monkeypatch):
     monkeypatch.setenv("HARDLINE_DSH_WAKE_URL", "http://127.0.0.1:8791/notice")
     monkeypatch.setenv("HARDLINE_DSH_WAKE_TOKEN", "a" * 64)
     monkeypatch.setenv("HARDLINE_DSH_CLIENT_NAME", "dsh-mcp-client")
+    monkeypatch.setenv("HARDLINE_DSH_WAKE_ROUTE", "test-route")
     monkeypatch.setenv("HARDLINE_AGENT", "claude")
 
 
@@ -40,7 +41,8 @@ def test_bad_destinations_fail_closed(config, monkeypatch, bad):
 
 @pytest.mark.parametrize("key,value", [("HARDLINE_DSH_WAKE_TOKEN", "secret"),
     ("HARDLINE_DSH_CLIENT_NAME", "claude-code"), ("HARDLINE_DSH_CLIENT_NAME", "codex-mcp-client"),
-    ("HARDLINE_AGENT", ""), ("HARDLINE_AGENT", "unknown")])
+    ("HARDLINE_AGENT", ""), ("HARDLINE_AGENT", "unknown"),
+    ("HARDLINE_DSH_WAKE_ROUTE", ""), ("HARDLINE_DSH_WAKE_ROUTE", "bad route")])
 def test_incomplete_or_conflicting_config_is_rejected(config, monkeypatch, key, value):
     monkeypatch.setenv(key, value)
     with pytest.raises(ValueError, match="invalid DSH wake configuration"):
@@ -49,7 +51,7 @@ def test_incomplete_or_conflicting_config_is_rejected(config, monkeypatch, key, 
 
 @pytest.mark.parametrize("status,error", [(202, None), (403, announce.NotSent),
     (500, RuntimeError), (302, RuntimeError)])
-def test_loopback_payload_contains_only_nonce(config, monkeypatch, status, error):
+def test_loopback_payload_contains_bound_route_and_agent(config, monkeypatch, status, error):
     requests = []
     class Response:
         pass
@@ -75,7 +77,7 @@ def test_loopback_payload_contains_only_nonce(config, monkeypatch, status, error
     else:
         wake.send(wake.address, text)
     method, path, body, headers = requests[0]
-    assert (method, path, body) == ("POST", "/notice", {"nonce": "0123456789abcdef"})
+    assert (method, path, body) == ("POST", "/notice", {"nonce": "0123456789abcdef", "agent": "claude", "route": "test-route"})
     assert headers["Authorization"] == "Bearer " + "a" * 64
 
 

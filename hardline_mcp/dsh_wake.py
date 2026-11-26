@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from . import adapters, announce
 
-_KEYS = ("HARDLINE_DSH_WAKE_URL", "HARDLINE_DSH_WAKE_TOKEN", "HARDLINE_DSH_CLIENT_NAME")
+_KEYS = ("HARDLINE_DSH_WAKE_URL", "HARDLINE_DSH_WAKE_TOKEN", "HARDLINE_DSH_CLIENT_NAME", "HARDLINE_DSH_WAKE_ROUTE")
 _RECEIPT = re.compile(r"receipt='([a-f0-9]{16})'")
 
 
@@ -26,10 +26,11 @@ def from_env(*, fulfil=None, poll_s=None):
     values = [os.environ.get(k, "") for k in _KEYS]
     if not any(values):
         return None
-    url, token, client_name = values
+    url, token, client_name, route = values
     agent = os.environ.get("HARDLINE_AGENT", "").strip().lower()
     if (not all(values) or not re.fullmatch(r"[a-f0-9]{64}", token)
             or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", client_name)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", route)
             or client_name in {"claude-code", "codex-mcp-client"}
             or agent not in adapters.known_agents()):
         raise ValueError("invalid DSH wake configuration")
@@ -46,15 +47,16 @@ def from_env(*, fulfil=None, poll_s=None):
     if poll_s is not None:
         options["poll_s"] = poll_s
     return DshWake(client_name=client_name, address=url, port=port, token=token,
-                   agent=agent, **options)
+                   agent=agent, route=route, **options)
 
 
 class DshWake(announce.Announcer):
     transport = "dsh-experimental"
 
-    def __init__(self, *, client_name, address, port, token, agent, **kwargs):
+    def __init__(self, *, client_name, address, port, token, agent, route, **kwargs):
         super().__init__(address=address, **kwargs)
         self.client, self._port, self._token, self._agent = client_name, port, token, agent
+        self._route = route
 
     def arm(self, client):
         self.declare()
@@ -83,7 +85,8 @@ class DshWake(announce.Announcer):
             except Exception:
                 raise announce.NotSent("notice endpoint connection failed") from None
             try:
-                conn.request("POST", "/notice", json.dumps({"nonce": match[0]}).encode("ascii"),
+                conn.request("POST", "/notice", json.dumps({"nonce": match[0], "agent": self._agent,
+                                                            "route": self._route}).encode("ascii"),
                              {"Authorization": "Bearer " + self._token,
                               "Content-Type": "application/json"})
                 response = conn.getresponse()

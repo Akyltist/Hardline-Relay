@@ -39,6 +39,7 @@ async def test_real_hardline_notice_fake_dsh_receipt_and_next_message(store, mon
         monkeypatch.setenv("HARDLINE_DSH_WAKE_URL", f"http://127.0.0.1:{ready['port']}/notice")
         monkeypatch.setenv("HARDLINE_DSH_WAKE_TOKEN", secret)
         monkeypatch.setenv("HARDLINE_DSH_CLIENT_NAME", "dsh-mcp-client")
+        monkeypatch.setenv("HARDLINE_DSH_WAKE_ROUTE", "test-route")
         monkeypatch.setenv("HARDLINE_AGENT", "claude")
         async with anyio.create_task_group() as tg:
             wire = await serving(tg, channel.Pusher(poll_s=0.02))
