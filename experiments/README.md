@@ -24,6 +24,12 @@ delivery. Database credentials must remain exclusively on a trusted server;
 clients must not receive direct database access. Test credentials and HTTP do
 not establish an individual's identity or right to represent them.
 
+`lan_tls_proxy.py`, `lan_tls_client.py`, and `lan_pilot.py` are a separate,
+manually started mTLS experiment for a synthetic-mail two-computer pilot. They
+do not make the underlying mailbox production-ready. See [LAN_PILOT.md](LAN_PILOT.md)
+for prerequisites, tested scope, and known limitations; do not expose the plain
+HTTP gateway or use the team's mailbox.
+
 `mcp_loopback_client.py` supplies four experimental MCP tools and a limited
 `inbox`/`ack` subset over stdio, backed by the loopback gateway. The latter
 exercises non-consuming reads, pagination and atomic auto-ack, but is not the

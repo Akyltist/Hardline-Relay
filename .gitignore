@@ -7,6 +7,11 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+*.pem
+*.key
+*.p12
+bindings.json
+pilot-credentials/
 research/
 .claude/worktrees/
 uv.lock
