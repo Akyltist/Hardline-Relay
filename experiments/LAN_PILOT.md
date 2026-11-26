@@ -1,5 +1,7 @@
 # Isolated two-computer LAN pilot
 
+> Update: isolated message exchange between two computers has been verified. A separate experimental wake receiver is described in [LAN wake setup](../docs/LAN_WAKE_RU.md); wake of a real DSH session is not yet confirmed. This is not a production-ready system. The historical status below predates these tests.
+
 This is a development experiment, not a replacement for Hardline. Its mailbox
 is separate from the team's SQLite mailbox. Use only synthetic test accounts
 and messages. A test message to `pilot:local` is not delivered to `codex:do`.

@@ -1,0 +1,10 @@
+{
+  "name": "@local/lan-receiver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./index.mjs", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
+  "files": ["index.mjs", "cordis.patch.yml", "locale/*.json", "icon.svg", "docs"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/dsh-llm": "0.2.2-rc.5", "@deepseek-ai/dsh-agent": "0.2.2-rc.5" }
+}

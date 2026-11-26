@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300">
+  <rect width="640" height="300" rx="20" fill="#f3f5f9"/>
+  <rect x="60" y="90" width="180" height="120" rx="16" fill="#ffffff" stroke="#b7c3d2" stroke-width="2"/>
+  <text x="150" y="158" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="15" fill="#247bbf">MCP</text>
+  <path d="M255 150h110" fill="none" stroke="#e08a1e" stroke-width="3" stroke-linecap="round"/>
+  <path d="M370 150l-14-9v18z" fill="#e08a1e"/>
+  <rect x="400" y="80" width="190" height="140" rx="16" fill="#ffffff" stroke="#b7c3d2" stroke-width="2"/>
+  <text x="495" y="145" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="15" fill="#247bbf">127.0.0.1</text>
+  <text x="495" y="170" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="13" fill="#7b8b9f">/notice {nonce}</text>
+</svg>

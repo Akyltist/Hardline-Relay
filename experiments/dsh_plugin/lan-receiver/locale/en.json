@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "LAN test receiver",
+    "description": "Opt-in loopback notice receiver for the network test channel: wakes exactly one pinned session, carries no mail content.",
+    "detail": "docs/DETAIL.md"
+  }
+}

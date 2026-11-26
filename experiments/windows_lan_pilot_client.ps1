@@ -8,7 +8,14 @@ param(
 $ErrorActionPreference = 'Stop'
 try {
     $config = Get-Content -LiteralPath (Join-Path $CredentialDirectory 'client.json') -Raw | ConvertFrom-Json
-    if ($config.agent -notin @('pilot:local', 'pilot:remote')) { throw 'Invalid synthetic pilot agent' }
+    if ($config.agent -cnotin @('pilot:local', 'pilot:remote', 'pilot:berlin')) { throw 'Invalid synthetic pilot agent' }
+    # An inherited lane is never authoritative; derive it from protected client.json.
+    if ((Test-Path Env:HARDLINE_PILOT_DSH_WAKE_URL) -or (Test-Path Env:HARDLINE_PILOT_DSH_WAKE_TOKEN)) {
+        $env:HARDLINE_PILOT_DSH_WAKE_LANE = [string]$config.agent
+    }
+    else {
+        Remove-Item Env:HARDLINE_PILOT_DSH_WAKE_LANE -ErrorAction SilentlyContinue
+    }
     $env:HARDLINE_LAN_TEST_HOST = [string]$config.server_ip
     $env:HARDLINE_LAN_TEST_PORT = [string]$ServerPort
     $env:HARDLINE_LAN_TEST_CA = Join-Path $CredentialDirectory 'ca.crt'

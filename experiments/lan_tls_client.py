@@ -1,22 +1,26 @@
 """Isolated LAN pilot client; not compatible with the real Hardline mailbox.
 
-Requires mutual TLS and a separate test credential. No automatic wake or
-accepted receipt is provided. The existing MCP test tools are reused only in
+Requires mutual TLS and a separate test credential. Optional local DSH wake
+does not provide an accepted receipt. MCP test tools are reused only in
 this dedicated process; the real Hardline server is never imported or changed.
 """
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import ipaddress
 import json
 import os
 import re
+import secrets
 import ssl
 from urllib import error, request
 
 from mcp.server.fastmcp import FastMCP
 
 from experiments import mcp_loopback_client as client
+from experiments.lan_notice_loop import NoticeLoop
 
 
 _MAX_RESPONSE = 1024 * 1024
@@ -26,6 +30,68 @@ _PRIVATE_NETS = tuple(map(ipaddress.ip_network, ("10.0.0.0/8", "172.16.0.0/12", 
 class _NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _wake_configuration():
+    """Fail closed on partial or malformed optional local wake configuration."""
+    url = os.environ.get("HARDLINE_PILOT_DSH_WAKE_URL")
+    token = os.environ.get("HARDLINE_PILOT_DSH_WAKE_TOKEN")
+    lane = os.environ.get("HARDLINE_PILOT_DSH_WAKE_LANE")
+    if url is None and token is None and lane is None:
+        return None
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})/notice", url or "")
+    if (not match or not 1 <= int(match.group(1)) <= 65535
+            or not re.fullmatch(r"[0-9a-f]{64}", token or "")
+            or lane not in {"pilot:remote", "pilot:berlin"}):
+        raise RuntimeError("invalid pilot DSH wake configuration")
+    return url, token, lane
+
+
+def _read_pilot_unread(after_id: int, lane: str) -> dict:
+    # Uses the exact same lock, identity and lease as the MCP tools.
+    return client.gateway_call("/inbox-compatible", {
+        "agent": lane, "unread_only": True, "limit": 25,
+        "auto_ack": False, "receipt": None, "after_id": after_id,
+    })
+
+
+def _post_wake(url: str, token: str) -> bool:
+    """202 means host accepted followup, not a mailbox receipt or ack."""
+    req = request.Request(url, data=json.dumps({"nonce": secrets.token_hex(8)}).encode(),
+                          headers={"Authorization": "Bearer " + token,
+                                   "Content-Type": "application/json"}, method="POST")
+    opener = request.build_opener(request.ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(req, timeout=15) as response:
+            if response.status == 202:
+                return True
+            # Unexpected successful response does not establish delivery state.
+            raise RuntimeError("unknown pilot wake outcome")
+    except error.HTTPError as exc:
+        if 400 <= exc.code < 500:
+            return False
+        raise RuntimeError("unknown pilot wake outcome") from None
+    except (error.URLError, OSError, ValueError):
+        raise RuntimeError("unknown pilot wake outcome") from None
+
+
+def _wake_lifespan(config):
+    url, token, lane = config
+    @asynccontextmanager
+    async def lifespan(_mcp):
+        stop = asyncio.Event()
+
+        async def notify(_notice):
+            return await asyncio.to_thread(_post_wake, url, token)
+
+        loop = NoticeLoop(lambda after_id: _read_pilot_unread(after_id, lane), notify)
+        task = asyncio.create_task(loop.run(stop))
+        try:
+            yield {}
+        finally:
+            stop.set()
+            await task
+    return lifespan
 
 
 def _configuration():
@@ -88,7 +154,8 @@ def tls_request(path: str, payload: dict, lease: int | None = None) -> dict:
 
 def create_test_mcp():
     """Expose only synthetic pilot tools; inbox never defaults to auto-ack."""
-    mcp = FastMCP("hardline-lan-pilot")
+    wake = _wake_configuration()
+    mcp = FastMCP("hardline-lan-pilot", lifespan=_wake_lifespan(wake) if wake else None)
     for tool in (client.experimental_send, client.experimental_send_to_person,
                  client.experimental_inbox, client.experimental_ack, client.ack):
         mcp.tool()(tool)
