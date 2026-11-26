@@ -1,0 +1,393 @@
+"""Wake a running agent session with one constant notice at a time.
+
+The core of Codex queue-wake (``codex_queue``, docs/codex-queue-wake.md) and
+Claude inbox-wake (``claude_inbox``, docs/claude-inbox-wake.md), beside the
+channel pusher in the same serving loop. A subclass says which client it
+serves, how a notice is worded, how it is sent, and - when it is not known at
+startup - how the address is found.
+
+The notice is an idempotent pointer: constant text that tells the session to
+read its hardline inbox, with a receipt nonce as its only variable. A stale or
+duplicated notice only points at an inbox, so the transport never has to be
+tracked exactly: one notice is outstanding at a time, released only by its own
+receipt. New mail is announced once; deferred mail is not re-announced.
+
+A send that may or may not have delivered is sent again, the same notice with
+the same receipt, after a growing wait (``RETRY_S`` doubling to
+``MAX_RETRY_S``), until a receipt settles it. Seen 2026-10-16: one failed
+``codex queue`` held a session's notice outstanding with nothing delivered, and
+its thread was never woken again. A send that succeeded is not sent again: it
+is somewhere the session will see it, and a Codex queue never deduplicates.
+"""
+
+from __future__ import annotations
+
+import secrets
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import Callable, Optional
+
+import anyio
+
+from . import adapters, channel, delivery, procid, sessions
+
+RETRY_S = 300.0  # the first wait before an unsettled notice is sent again
+MAX_RETRY_S = 3600.0  # where the doubling stops
+
+
+class NotSent(Exception):
+    """The transport delivered nothing - the address could not be reached.
+
+    Any other failure might have delivered the notice, so it stays outstanding.
+    """
+
+
+class Announcer:
+    """Wake state for this process's one connection of a ``client``."""
+
+    client = ""  # the clientInfo.name served
+    transport = ""  # reported beside the delivery state
+
+    def __init__(
+        self,
+        *,
+        address: object = None,
+        fulfil: Optional[Callable[[], list[str]]] = None,
+        clock: Callable[[], datetime] = channel._now,
+        poll_s: float = channel.POLL_S,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        self.address = address  # given at startup, or pinned by a subclass
+        self.fulfil = fulfil
+        self.clock = clock
+        self.poll_s = poll_s
+        self.monotonic = monotonic  # retry deadlines; the clock is for recorded facts
+        self.stopped = False  # set once, never cleared: no further notices
+        self.outstanding: Optional[tuple[str, datetime]] = None  # (nonce, sent at)
+        self._retry_at: Optional[float] = None  # when the outstanding notice is sent again
+        self._failures = 0  # unsettled sends of the outstanding notice
+        self.announced: set[int] = set()
+        self.pointed: dict[str, int] = {}  # name held before -> newest id told
+        self._previous_pointed: dict[str, int] = {}  # restored by take_back
+        self.facts: dict = {}
+        self.routes: dict = {}  # delivery.ROUTE_KEYS, a table of their own
+        self._routes_dirty = False
+        self._previous_push: Optional[datetime] = None  # restored by take_back
+        self._dirty = False
+        self._pruned = False
+        self._cursor = 0
+        self._last_fulfil: Optional[datetime] = None
+        self._notes: list[str] = []  # logged by the poll thread, never the loop
+        # Evidence arrives on the event loop and receipts on tool threads, so
+        # both only touch memory, under this lock; the poll thread alone does
+        # I/O - facts and logging - so writes need no ordering.
+        self._lock = threading.Lock()
+
+    def notice(self, nonce: str) -> str:
+        raise NotImplementedError
+
+    def send(self, address, text: str) -> None:
+        """Deliver ``text``. Raises ``NotSent`` if nothing was delivered; any
+        other failure may have delivered it."""
+        raise NotImplementedError
+
+    def arm(self, client: dict) -> None:
+        """Called once the client is known to be this one's. Memory only."""
+
+    # ── evidence ─────────────────────────────────────────────────────────────
+
+    def declare(self) -> None:
+        """The address is known: from here the session reads ``declared``.
+        Caller holds ``_lock``."""
+        self.facts = {"declared_at": self.clock()}
+        self._dirty = True
+
+    def accept_receipt(self, nonce: str) -> bool:
+        """A receipt proves the notice that carried it - that one only.
+
+        The only thing that releases a notice: a call made by the turn a
+        notice started is no proof, since one turn makes many calls, and a
+        call made after the next notice went out would release that one.
+        """
+        with self._lock:
+            if self.outstanding is None or self.outstanding[0] != nonce:
+                return False
+            self.facts["last_receipted_push_at"] = self.outstanding[1]
+            if not self.stopped:  # a stopped wake never reads as receipted again
+                self.facts["oldest_unreceipted_at"] = None
+            self.outstanding = None
+            self._retry_at, self._failures = None, 0  # settled, by any copy that landed
+            self._dirty = True
+            return True
+
+    def unsettled(self, nonce: str, why: str) -> None:
+        """A send of ``nonce`` may not have delivered: send it again later,
+        unless a receipt settled it meanwhile. Memory only."""
+        with self._lock:
+            if self.outstanding is None or self.outstanding[0] != nonce:
+                return
+            self._failures += 1
+            wait = min(RETRY_S * 2 ** min(self._failures - 1, 16), MAX_RETRY_S)
+            self._retry_at = self.monotonic() + wait
+            self._notes.append(
+                f"{self.transport} notice unsettled ({why}); sent again in {wait:.0f} s"
+            )
+
+    def state(self) -> Optional[str]:
+        with self._lock:
+            facts = dict(self.facts)
+        return delivery.derive(facts, self.clock()) if facts else None
+
+    # ── one poll ─────────────────────────────────────────────────────────────
+
+    def _flush(self) -> None:
+        """Write facts if they changed, and pending notes. Best effort: a report,
+        never a failure - but a failed write is retried on the next poll."""
+        with self._lock:
+            notes, self._notes = self._notes, []
+            facts, dirty, self._dirty = dict(self.facts), self._dirty, False
+            routes, routes_dirty = dict(self.routes), self._routes_dirty
+            self._routes_dirty = False
+        for note in notes:
+            channel._log(note)
+        if not dirty and not routes_dirty:
+            return
+        try:
+            pid, key = procid.current_identity()
+            if key is None:
+                raise RuntimeError("no process identity to record facts under")
+            if not self._pruned:
+                delivery.prune()
+                self._pruned = True
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._dirty = self._dirty or dirty
+                self._routes_dirty = self._routes_dirty or routes_dirty
+            channel._log(f"{self.transport} delivery facts not recorded: {type(exc).__name__}: {exc}")
+            return
+        # Separate writes: a failure of one is retried, and never loses the other.
+        for what, flag, wanted, write, args in (
+            ("delivery facts", "_dirty", dirty, delivery.record, facts),
+            ("route facts", "_routes_dirty", routes_dirty, delivery.record_routes, routes),
+        ):
+            if not wanted:
+                continue
+            try:
+                write(pid, key, **args)
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    setattr(self, flag, True)  # retried on the next poll
+                channel._log(f"{self.transport} {what} not recorded: {type(exc).__name__}: {exc}")
+
+    def poll(self) -> Optional[tuple[object, str, Optional[set[int]]]]:
+        """``(address, nonce, ids)`` to send now, if anything. Blocking; off the loop.
+
+        Recorded as outstanding, and its mail as announced, BEFORE it is sent:
+        an attempt counts whatever its outcome, unless the transport says it
+        delivered nothing (``take_back``). An unsettled one is due again, the
+        same notice, with ``ids`` None: its mail was announced by the first.
+        A resend chosen here is not revalidated before it goes: a receipt that
+        lands meanwhile lets one copy follow settlement, rescheduled by nothing.
+        """
+        now = self.clock()
+        if self.fulfil and (
+            self._last_fulfil is None or now - self._last_fulfil >= timedelta(seconds=channel.FULFIL_S)
+        ):
+            self._last_fulfil = now
+            self.fulfil()
+        self._flush()
+        address = self.address
+        if address is None:
+            return None  # no address yet; set once, never unset
+        with self._lock:
+            # Before the scan: an outstanding notice's own mail is announced,
+            # so the scan finds nothing new and would return before this.
+            if (
+                not self.stopped
+                and self.outstanding is not None
+                and self._retry_at is not None
+                and self.monotonic() >= self._retry_at
+            ):
+                self._retry_at = None  # one attempt at a time; its outcome reschedules
+                return address, self.outstanding[0], None
+        owned = adapters.owned_recipients()
+        start = self._cursor
+        rows, self._cursor = channel.unread(owned, after=start)
+        if start == 0 and self._cursor == 0:
+            self.announced &= {r["id"] for r in rows}  # a full sweep: forget read mail
+        new = [r for r in rows if r["id"] not in self.announced]
+        if new:
+            held = set(sessions.granted(owned))
+            new = [r for r in new if r["recipient"] in held]
+        # Newer mail at a name this conversation held before wakes it too: the
+        # same notice, whose inbox read lists the name as previously_held. Kept
+        # apart from ``announced``, so a reclaim is still announced afterwards.
+        # It shares the one-outstanding gate: until its receipt, it holds the
+        # next notice too, as any notice does.
+        told = {
+            lane: newest
+            for lane, (newest, _) in channel.waiting_before().items()
+            if newest > self.pointed.get(lane, 0)
+        }
+        if not new and not told:
+            return None
+        nonce = secrets.token_hex(8)
+        ids = {r["id"] for r in new}
+        with self._lock:
+            # Decided here, under the lock that reserves, and nowhere else: a
+            # stop may have been decided while the store was being read.
+            if self.stopped or self.outstanding is not None:
+                return None
+            self.announced |= ids
+            self._previous_pointed = dict(self.pointed)
+            self.pointed.update(told)
+            self.outstanding = (nonce, now)
+            self._previous_push = self.facts.get("last_push_at")
+            self.facts["last_push_at"] = now
+            self.facts["oldest_unreceipted_at"] = now
+            self._dirty = True
+        self._flush()
+        return address, nonce, ids
+
+    def take_back(self, nonce: str, ids: set[int]) -> None:
+        """Undo a reservation whose notice was never delivered: its mail is
+        announced again, and the facts - written now, not after the backoff -
+        say no push happened. Blocking; off the loop."""
+        with self._lock:
+            if self.outstanding is None or self.outstanding[0] != nonce:
+                return  # already receipted: it was delivered after all
+            self.outstanding = None
+            self.announced -= ids
+            self.pointed = self._previous_pointed
+            self.facts["last_push_at"] = self._previous_push
+            # A stopped wake keeps its unanswered mark, dated from the push
+            # restored above (as the stop itself dates it).
+            self.facts["oldest_unreceipted_at"] = self._previous_push if self.stopped else None
+            self._dirty = True
+        self._flush()
+
+    # ── the loop ─────────────────────────────────────────────────────────────
+
+    def _dispatch(self, address: object, nonce: str, ids: Optional[set[int]]) -> None:
+        """Recheck an initial, provably unsent reservation beside its send.
+
+        Retries may already have delivered, so acking their mail cannot cancel
+        them. The initial batch alone absorbs arrivals during its fixed window;
+        mutate its ids too, so NotSent rolls back the entire batch.
+        """
+        if ids is not None:
+            try:
+                owned = adapters.owned_recipients()
+                rows, _ = channel.unread(owned)  # bounded scan; leave the poll cursor alone
+                with self._lock:
+                    previous = dict(self._previous_pointed)
+                    pointed = dict(self.pointed)
+                hint_lanes = {
+                    lane for lane, newest in pointed.items() if newest > previous.get(lane, 0)
+                }
+                # Unlike waiting_before(), this must not hide a read failure as
+                # evidence that the reserved hint has nothing left to announce.
+                hints = (
+                    channel.waiting(tuple(hint_lanes & set(channel.held_before())))
+                    if hint_lanes else {}
+                )
+                hinted = any(newest > previous.get(lane, 0) for lane, (newest, _) in hints.items())
+                pending_recipients = set()
+                reserved = sorted(ids)
+                for start in range(0, len(reserved), 500):
+                    part = tuple(reserved[start:start + 500])
+                    marks = ",".join("?" for _ in part)
+                    # Exact reserved ids: a full inbox page cannot hide the
+                    # reservation, nor can unrelated newer mail keep it alive.
+                    pending_recipients.update(
+                        row["recipient"]
+                        for row in channel._read(
+                            f"SELECT recipient FROM messages WHERE id IN ({marks}) AND acked_at IS NULL",
+                            part,
+                        )
+                    )
+                held = set(sessions.granted(adapters.owned_recipients()))
+                pending = bool(pending_recipients & held)
+                with self._lock:
+                    cancel = self.stopped or not (pending or hinted)
+                    if not cancel and self.outstanding is not None and self.outstanding[0] == nonce:
+                        batched = {r["id"] for r in rows if r["recipient"] in held} - self.announced
+                        self.announced |= batched
+                        ids |= batched
+                        self.pointed.update({lane: newest for lane, (newest, _) in hints.items()})
+                    else:
+                        cancel = True
+                if cancel:
+                    self.take_back(nonce, ids)
+                    return
+            except Exception as exc:
+                # All failures above precede transport dispatch. Roll back and
+                # poll again, rather than treating an unreadable store as empty.
+                raise NotSent(f"reservation not revalidated: {exc}") from exc
+        self.send(address, self.notice(nonce))
+
+    async def run(self, initialized: anyio.Event, client: dict) -> None:
+        """Wake until cancelled, for this one's client only."""
+        await initialized.wait()
+        if client.get("name") != self.client:
+            return
+        with self._lock:
+            self.arm(client)
+        delay = self.poll_s
+        while True:
+            # Isolated like the channel pusher: a fault is logged and retried
+            # with backoff, never allowed to cancel the task group serving tools.
+            try:
+                due = await anyio.to_thread.run_sync(self.poll)
+                if due:
+                    address, nonce, ids = due
+                    if ids is not None:
+                        # One fixed window, never extended by later arrivals.
+                        await anyio.sleep(self.poll_s)
+                    try:
+                        await anyio.to_thread.run_sync(self._dispatch, address, nonce, ids)
+                    except NotSent as exc:
+                        if ids is None:  # a resend: the first may still have landed
+                            self.unsettled(nonce, f"not sent: {exc}")
+                        else:
+                            await anyio.to_thread.run_sync(self.take_back, nonce, ids)
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - may have delivered
+                        self.unsettled(nonce, f"{type(exc).__name__}: {exc}")
+                delay = self.poll_s
+            except Exception as exc:  # noqa: BLE001 - isolation is the point
+                with self._lock:
+                    self._notes.append(f"{self.transport} wake {type(exc).__name__}: {exc}")
+                delay = min(delay * 2, channel.MAX_BACKOFF_S)
+            await anyio.sleep(delay)
+
+
+# One server per process, so one connection and at most one of each wake.
+_installed: list[Announcer] = []
+
+
+def install(*wakes: Announcer) -> None:
+    """Make ``wakes`` the ones receipts and state are answered from."""
+    _installed[:] = wakes
+
+
+def add(wake: Announcer) -> Announcer:
+    """Answer from ``wake`` too: one chosen after the client connected."""
+    _installed.append(wake)
+    return wake
+
+
+def accept_receipt(nonce: str) -> bool:
+    return any(wake.accept_receipt(nonce) for wake in _installed)
+
+
+def status() -> tuple[Optional[str], Optional[str]]:
+    """``(delivery state, transport)`` of the wake serving this connection;
+    ``(None, None)`` until one has a state. No transport until it has an
+    address: an unpinned Codex wake may say ``not_top_level``, sending nothing."""
+    for wake in _installed:
+        state = wake.state()
+        if state:
+            return state, wake.transport if wake.address is not None else None
+    return None, None

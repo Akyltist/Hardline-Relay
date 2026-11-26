@@ -1,0 +1,2945 @@
+"""Tests for hardline_mcp.adapters — subprocess is monkeypatched (no real spawns)."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+import pytest
+
+from hardline_mcp import adapters
+
+
+@pytest.fixture
+def allow_write(monkeypatch):
+    """Opt this hardline-mcp process into write mode, the way an operator
+    would. Tests of the gate *itself* set the variable explicitly instead —
+    for them its value is the thing under test, not setup."""
+    monkeypatch.setenv("HARDLINE_ALLOW_WRITE", "1")
+
+
+class _FakeCompleted:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class _FakePopen:
+    """Stands in for the real child process.
+
+    ``_run_cmd`` moved from ``subprocess.run`` to ``Popen`` so a job can record
+    the child's pid and a cancel from another process can reach it. This fake
+    has to follow, and it must be complete: while it was still patching
+    ``run``, every one of these tests spawned a REAL ``claude``/``codex`` and
+    the suite hung on a 900-second timeout.
+    """
+
+    FAKE_PID = 424242
+
+    def __init__(self, cmd, kwargs, result, exc, calls):
+        self.pid = self.FAKE_PID
+        self.returncode = None
+        self._result = result
+        self._exc = exc
+        self._calls = calls
+        self._drain = None
+        self.killed = False
+        # The real Popen exposes these as pipes; nothing under test reads
+        # them after communicate(), and that is deliberately what the code
+        # must NOT do (they are closed objects, not the captured text).
+        self.stdout = None
+        self.stderr = None
+
+    def communicate(self, input=None, timeout=None):
+        # The timeout moved from run(timeout=) to communicate(timeout=), so
+        # record it where the assertions already look for it - and the stdin
+        # text beside it, the first time (a drain after a kill sends none).
+        if self._calls:
+            self._calls[-1]["kwargs"]["timeout"] = timeout
+            self._calls[-1]["kwargs"].setdefault("input", input)
+        if self._exc is not None:
+            exc, self._exc = self._exc, None  # raise once; the drain must not
+            # With Popen, a TimeoutExpired from communicate() does NOT carry
+            # the partial output — the caller kills the child and drains. Model
+            # that: this second call is the drain, and it yields exactly what
+            # the child had buffered.
+            self._drain = (getattr(exc, "stdout", None), getattr(exc, "stderr", None))
+            raise exc
+        if self._drain is not None:
+            return self._drain
+        result = self._result if self._result is not None else _FakeCompleted(stdout="ok")
+        self.returncode = result.returncode
+        return result.stdout, result.stderr
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _capture_run(monkeypatch, result=None, exc=None):
+    """Patch adapters._run_cmd's subprocess.Popen; record the argv it was given.
+
+    A spawn-time failure (FileNotFoundError/OSError) is raised from the
+    constructor and a TimeoutExpired from communicate(), matching where the
+    real subprocess raises each.
+    """
+    calls = []
+
+    def fake_popen(cmd, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        if exc is not None and isinstance(exc, OSError):
+            raise exc
+        return _FakePopen(cmd, kwargs, result, exc, calls)
+
+    monkeypatch.setattr(adapters.subprocess, "Popen", fake_popen)
+    # taskkill on the timeout path must never reach a real process either.
+    monkeypatch.setattr(
+        adapters, "_kill_tree", lambda proc: setattr(proc, "killed", True)
+    )
+    return calls
+
+
+def test_ask_hermes_shells_hermes_chat(monkeypatch):
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="hermes says hi"))
+    out = adapters.ask("hermes", "what is your status")
+    assert out["ok"] is True
+    assert out["reply"] == "hermes says hi"
+    argv = calls[0]["cmd"]
+    assert "hermes" in argv[0].lower() or argv[0] == "hermes"
+    assert "chat" in argv and "-Q" in argv and "what is your status" in argv
+    # -Q must precede -q so -q consumes the prompt, not -Q
+    assert argv.index("-Q") < argv.index("-q")
+    assert calls[0]["kwargs"]["timeout"] == 180
+
+
+def _codex_reply(text):
+    """What `codex exec --json` prints for a turn that answered ``text``."""
+    return (
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+        + "\n"
+        + json.dumps({"type": "turn.completed", "usage": {}})
+        + "\n"
+    )
+
+
+def test_ask_codex_shells_codex_exec(monkeypatch):
+    # A current PATH install must win over a stale legacy app installation.
+    monkeypatch.delenv("HARDLINE_CODEX_CMD", raising=False)
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: "C:/path/codex.exe")
+    monkeypatch.setattr(
+        adapters, "_discover_codex", lambda: "C:/legacy/codex.exe"
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask("codex", "summarize")
+    assert out["ok"] is True
+    assert out["reply"] == "codex reply"
+    argv = calls[0]["cmd"]
+    # A bare call reads JSONL too: only events show commands that never ran.
+    assert "--json" in argv
+    assert argv[0] == "C:/path/codex.exe" and "exec" in argv
+    # Omitted model -> no --model flag at all; Codex's own configured default
+    # applies, same posture ask_hermes already has toward Hermes's default.
+    assert "--model" not in argv
+    assert "--ephemeral" in argv
+    assert argv[-2:] == ["--", "summarize"]
+
+
+def test_deliver_to_codex_defers_to_codex_own_default(monkeypatch):
+    monkeypatch.delenv("HARDLINE_CODEX_CMD", raising=False)
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: None)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("delivered")))
+
+    out = adapters.deliver("codex", "--dangerously-bypass-approvals-and-sandbox")
+
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert "--model" not in argv
+    assert "--ephemeral" in argv
+    assert argv[-2:] == ["--", "--dangerously-bypass-approvals-and-sandbox"]
+
+
+def test_ask_claude_shells_claude_p(monkeypatch):
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="claude reply"))
+    out = adapters.ask("claude", "hello")
+    assert out["ok"] is True
+    assert out["reply"] == "claude reply"
+    argv = calls[0]["cmd"]
+    assert argv[0] == "claude" and "-p" in argv
+    # Omitted model -> no --model flag at all; Claude Code's own configured
+    # default applies (it previously pinned an explicit alias, added when a
+    # stale global settings.json override was found governing unflagged
+    # calls - that override has since been removed, so there is no longer a
+    # reason for hardline to second-guess Claude Code's own default).
+    assert "--model" not in argv
+    # Prompt is separated so a prompt starting with "-" can't be read as a flag.
+    assert argv[-2:] == ["--", "hello"]
+
+
+def test_deliver_to_claude_also_defers_to_claude_own_default(monkeypatch):
+    """The send(deliver=true) push-notice path uses deliver() == ask(), which
+    must behave identically to a direct ask_claude() call - not some other
+    unpinned claude -p dispatch."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="delivered"))
+    out = adapters.deliver("claude", "[hardline] new message #1 from hermes.")
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert "--model" not in argv
+
+
+def test_ask_claude_explicit_sonnet_still_gets_full_telemetry(monkeypatch):
+    """An *explicit* model="sonnet" is a different caller intent than
+    omitting model - it must still take the stream-json/telemetry path,
+    same as any other explicit model, not the lightweight default shortcut."""
+    stdout = _claude_stream(
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-sonnet-5",
+            "apiKeySource": "none",
+        },
+        {
+            "type": "assistant",
+            "message": {"model": "claude-sonnet-5", "content": []},
+        },
+        {"type": "result", "subtype": "success", "result": "reviewed"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("hello", model="sonnet")
+
+    assert out["ok"] is True
+    assert out["actual_model"] == "claude-sonnet-5"
+    assert out["requested_model"] == "sonnet"
+    argv = calls[0]["cmd"]
+    assert "--output-format" in argv and "stream-json" in argv
+
+
+def test_ask_claude_uses_longer_default_timeout(monkeypatch):
+    monkeypatch.delenv("HARDLINE_CLAUDE_TIMEOUT_S", raising=False)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="claude reply"))
+
+    out = adapters.ask("claude", "perform a substantive review")
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["timeout"] == 900
+
+
+def test_ask_claude_timeout_can_be_configured(monkeypatch):
+    monkeypatch.setenv("HARDLINE_CLAUDE_TIMEOUT_S", "1200")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="claude reply"))
+
+    out = adapters.ask("claude", "perform a very substantive review")
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["timeout"] == 1200
+
+
+@pytest.mark.parametrize("value", ["forever", "", "   ", "0", "-1"])
+@pytest.mark.parametrize("optioned", [False, True])
+def test_ask_claude_rejects_invalid_configured_timeout(monkeypatch, value, optioned):
+    monkeypatch.setenv("HARDLINE_CLAUDE_TIMEOUT_S", value)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="must not run"))
+
+    if optioned:
+        out = adapters.ask_claude("hello", model="fable")
+    else:
+        out = adapters.ask("claude", "hello")
+
+    assert out["ok"] is False
+    assert "HARDLINE_CLAUDE_TIMEOUT_S" in out["error"]
+    assert calls == []
+
+
+def test_hermes_timeout_is_not_environment_configurable(monkeypatch):
+    monkeypatch.setenv("HARDLINE_HERMES_TIMEOUT_S", "1200")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="reply"))
+
+    out = adapters.ask("hermes", "hello")
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["timeout"] == 180
+
+
+def _claude_stream(*events):
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def _codex_stream(*events):
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def test_ask_codex_routes_model_effort_and_reports_json_telemetry(monkeypatch):
+    monkeypatch.delenv("HARDLINE_CODEX_CMD", raising=False)
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: None)
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-123"},
+        {"type": "turn.started"},
+        {
+            "type": "item.completed",
+            "item": {"id": "item-1", "type": "agent_message", "text": "answer"},
+        },
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 12,
+                "cached_input_tokens": 3,
+                "output_tokens": 4,
+                "reasoning_output_tokens": 2,
+            },
+        },
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("review this", model="gpt-5.6-terra", effort="xhigh")
+
+    assert out["ok"] is True
+    assert out["reply"] == "answer"
+    assert out["requested_model"] == "gpt-5.6-terra"
+    assert out["actual_model"] is None
+    assert out["requested_effort"] == "xhigh"
+    assert out["effective_effort"] is None
+    assert out["thread_id"] == "thread-123"
+    assert out["usage"]["input_tokens"] == 12
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--model") + 1] == "gpt-5.6-terra"
+    assert argv[argv.index('model_reasoning_effort="xhigh"') - 1] == "-c"
+    assert "--json" in argv
+    assert "--ephemeral" in argv
+    assert argv[-2:] == ["--", "review this"]
+
+
+def test_ask_codex_allows_deep_multi_hour_reviews_by_default(monkeypatch):
+    monkeypatch.delenv("HARDLINE_CODEX_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: None)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("reply")))
+
+    out = adapters.ask("codex", "substantive review")
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["timeout"] == 14400
+
+
+def test_ask_codex_uses_configurable_long_timeout(monkeypatch):
+    monkeypatch.setenv("HARDLINE_CODEX_TIMEOUT_S", "1200")
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: None)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("reply")))
+
+    out = adapters.ask("codex", "substantive review")
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["timeout"] == 1200
+
+
+@pytest.mark.parametrize("value", ["forever", "", "0", "-1"])
+def test_ask_codex_rejects_invalid_configured_timeout(monkeypatch, value):
+    monkeypatch.setenv("HARDLINE_CODEX_TIMEOUT_S", value)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="must not run"))
+
+    out = adapters.ask_codex("hello", model="gpt-5.6-sol")
+
+    assert out["ok"] is False
+    assert "HARDLINE_CODEX_TIMEOUT_S" in out["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "", "HIGH"])
+def test_ask_codex_rejects_unsupported_effort(monkeypatch, effort):
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_codex("hello", model="gpt-5.6-sol", effort=effort)
+
+    assert out["ok"] is False
+    assert "effort" in out["error"].lower()
+    assert calls == []
+
+
+@pytest.mark.parametrize("model", ["", "--oss", "gpt 5.6 sol"])
+def test_ask_codex_rejects_unsafe_model(monkeypatch, model):
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_codex("hello", model=model)
+
+    assert out["ok"] is False
+    assert "model" in out["error"].lower()
+    assert calls == []
+
+
+def test_ask_codex_advisory_isolates_context_and_api_overrides(monkeypatch, tmp_path):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}}),
+        encoding="utf-8",
+    )
+    (codex_home / "AGENTS.md").write_text(
+        "Prefix every response with HARDLINE_GLOBAL_SENTINEL.", encoding="utf-8"
+    )
+    neutral_root = tmp_path / "neutral-root"
+    neutral_root.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    for name in adapters._CODEX_AUTH_OVERRIDE_ENV:
+        monkeypatch.setenv(name, "must-not-leak")
+    monkeypatch.setenv("OPENAI_FUTURE_PROVIDER_SECRET", "must-not-leak")
+    monkeypatch.setattr(adapters.tempfile, "mkdtemp", lambda prefix: str(neutral_root))
+    removed = []
+    monkeypatch.setattr(
+        adapters.shutil,
+        "rmtree",
+        lambda path, ignore_errors: removed.append((path, ignore_errors)),
+    )
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-advisory"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "reviewed"},
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 10}},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex(
+        "review", model="gpt-5.6-sol", effort="high", mode="advisory"
+    )
+
+    assert out["ok"] is True
+    assert out["subscription_configured"] is True
+    assert out["subscription_verified"] is None
+    argv = calls[0]["cmd"]
+    assert "--ignore-user-config" in argv
+    assert "--ignore-rules" in argv
+    assert argv.count("--skip-git-repo-check") == 1  # clap rejects a repeat
+    assert _pin(argv) == "read-only"
+    isolated_cwd = neutral_root / "workspace"
+    isolated_home = neutral_root / "codex-home"
+    assert argv[argv.index("-C") + 1] == str(isolated_cwd)
+    assert any("developer_instructions" in arg for arg in argv)
+    assert calls[0]["kwargs"]["cwd"] == str(isolated_cwd)
+    child_env = calls[0]["kwargs"]["env"]
+    assert all(name not in child_env for name in adapters._CODEX_AUTH_OVERRIDE_ENV)
+    assert "OPENAI_FUTURE_PROVIDER_SECRET" not in child_env
+    assert child_env["CODEX_HOME"] == str(isolated_home)
+    assert (isolated_home / "auth.json").exists()
+    assert not (isolated_home / "AGENTS.md").exists()
+    assert removed == [(str(neutral_root), True)]
+
+
+def test_ask_codex_uses_explicit_workdir(monkeypatch, tmp_path):
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-workdir"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}},
+        {"type": "turn.completed", "usage": {}},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("inspect", workdir=str(tmp_path))
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("-C") + 1] == str(tmp_path)
+
+
+def test_ask_codex_resolves_relative_workdir_once(monkeypatch, tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    monkeypatch.chdir(tmp_path)
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-relative"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}},
+        {"type": "turn.completed", "usage": {}},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("inspect", workdir="child")
+
+    assert out["ok"] is True
+    expected = str(child.resolve())
+    assert calls[0]["kwargs"]["cwd"] == expected
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("-C") + 1] == expected
+
+
+def test_ask_codex_write_disabled_by_default(monkeypatch, tmp_path):
+    # write=True must be refused outright unless this process's environment
+    # explicitly opts in - closes the gap where any hardline caller (e.g.
+    # Hermes, driven by inbound Discord messages with no approval gate on MCP
+    # tool calls) could otherwise reach unattended file writes with zero
+    # operator opt-in.
+    monkeypatch.delenv("HARDLINE_ALLOW_WRITE", raising=False)
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_codex("patch it", workdir=str(tmp_path), write=True)
+
+    assert out["ok"] is False
+    assert "HARDLINE_ALLOW_WRITE" in out["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", ["0", "false", "False", "no", "No", ""])
+def test_ask_codex_write_disabled_for_falsy_values(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("HARDLINE_ALLOW_WRITE", value)
+    out = adapters.ask_codex("patch it", workdir=str(tmp_path), write=True)
+    assert out["ok"] is False
+    assert "HARDLINE_ALLOW_WRITE" in out["error"]
+
+
+@pytest.mark.parametrize("value", ["1", " 1 ", "true", "True", "TRUE", "yes", "Yes"])
+def test_ask_codex_write_enabled_for_truthy_synonyms(monkeypatch, tmp_path, value):
+    # A typo'd-but-plausible value (e.g. HARDLINE_ALLOW_WRITE=true) must not
+    # be a silent footgun that leaves write mode looking "on" to an operator
+    # but actually off - accept the common spellings, case-insensitively.
+    monkeypatch.setenv("HARDLINE_ALLOW_WRITE", value)
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-write"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "patched"},
+        },
+        {"type": "turn.completed", "usage": {}},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("patch it", workdir=str(tmp_path), write=True)
+
+    assert out["ok"] is True
+
+
+@pytest.mark.parametrize("value", ["2", "enabled", "tru", "on"])
+def test_ask_codex_write_rejects_unrecognized_value(monkeypatch, tmp_path, value):
+    # Neither truthy nor falsy: must fail loud naming the bad value, not
+    # silently behave as disabled with no indication anything was wrong.
+    monkeypatch.setenv("HARDLINE_ALLOW_WRITE", value)
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_codex("patch it", workdir=str(tmp_path), write=True)
+
+    assert out["ok"] is False
+    assert "HARDLINE_ALLOW_WRITE" in out["error"]
+    assert value in out["error"]
+    assert calls == []
+
+
+def test_ask_codex_write_requires_workdir(allow_write):
+    out = adapters.ask_codex("patch it", write=True)
+    assert out["ok"] is False
+    assert "workdir" in out["error"].lower()
+
+
+def test_ask_codex_write_rejects_advisory_mode(allow_write, tmp_path):
+    out = adapters.ask_codex("patch it", write=True, mode="advisory")
+    assert out["ok"] is False
+    assert "advisory" in out["error"].lower()
+
+
+def test_ask_codex_write_adds_workspace_write_sandbox(
+    allow_write, monkeypatch, tmp_path
+):
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-write"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "patched"},
+        },
+        {"type": "turn.completed", "usage": {}},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("patch it", workdir=str(tmp_path), write=True)
+
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert _pin(argv) == "workspace-write"
+    assert 'approval_policy="never"' in _overrides(argv)
+    assert "-a" not in argv  # codex exec rejects it
+    assert argv[argv.index("-C") + 1] == str(tmp_path)
+
+
+_GIT_REFUSAL = "Reading additional input from stdin...\nNot inside a trusted directory and --skip-git-repo-check was not specified."
+
+
+def test_a_read_only_run_skips_codex_git_check_once(monkeypatch, tmp_path):
+    """Seen 2026-10-16: reviews of a scratch folder and a documents folder
+    failed outright on Codex's git check, which guards only writes. Exactly
+    once: clap rejects a repeated flag (advisory's count is checked with it)."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("ok")))
+    adapters.ask_codex("review", workdir=str(tmp_path))
+    assert calls[0]["cmd"].count("--skip-git-repo-check") == 1
+
+
+def test_a_write_run_keeps_codex_git_check_and_says_why_it_refused(
+    allow_write, monkeypatch, tmp_path
+):
+    calls = _capture_run(monkeypatch, _FakeCompleted(stderr=_GIT_REFUSAL, returncode=1))
+    out = adapters.ask_codex("patch it", workdir=str(tmp_path), write=True)
+    assert "--skip-git-repo-check" not in calls[0]["cmd"]
+    assert out.get("ok") is False and "git repository" in out.get("hint", ""), out
+
+
+def test_ask_codex_default_pins_the_read_only_sandbox(monkeypatch):
+    """This test previously asserted `--sandbox` was ABSENT by default, to keep
+    the argv byte-identical to before the write param existed. That preserved a
+    hole: with no --sandbox flag the child inherits the host's
+    ~/.codex/config.toml, and on a host with `[windows] sandbox = "elevated"`
+    and the target project marked trusted, a default ask_codex call ran
+    `echo x > probe.txt` and the file WAS written - while the docs promised
+    read-only unless write=True.
+
+    Stability of the argv is not worth an unenforced safety claim. The
+    guarantee has to come from the flag we pass.
+    """
+    monkeypatch.delenv("HARDLINE_CODEX_CMD", raising=False)
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: None)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+
+    out = adapters.ask_codex("summarize")
+
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert _pin(argv) == "read-only"
+    assert not [o for o in _overrides(argv) if o.startswith("approval_policy")]  # untouched on the read path
+
+
+def test_ask_codex_optioned_read_also_pins_read_only(monkeypatch):
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("summarize", effort="high")
+    argv = calls[0]["cmd"]
+    assert _pin(argv) == "read-only"
+
+
+def test_ask_codex_write_still_gets_workspace_write(monkeypatch, tmp_path, allow_write):
+    """The read-only pin must not shadow the write sandbox."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("fix it", workdir=str(tmp_path), write=True)
+    argv = calls[0]["cmd"]
+    assert _pin(argv) == "workspace-write"
+    assert "read-only" not in argv
+    assert 'approval_policy="never"' in _overrides(argv)
+
+
+# Captured at import: conftest replaces it with a stub inside every test.
+_real_sandbox_started = adapters._codex_sandbox_started
+
+
+def _windows_sandbox(argv: list[str]) -> list[str]:
+    return [a for a in argv if a.startswith("windows.sandbox=")]
+
+
+def _overrides(argv: list[str]) -> list[str]:
+    """What argv passes Codex as `-c` overrides: anywhere else it is no override."""
+    return [b for a, b in zip(argv, argv[1:]) if a == "-c"]
+
+
+def _profile(argv: list[str]) -> str | None:
+    """The permission profile argv selects, if any."""
+    selected = [o for o in _overrides(argv) if o.startswith("default_permissions=")]
+    return json.loads(selected[0].split("=", 1)[1]) if selected else None
+
+
+_BUILT_INS = {'":read-only"': "read-only", '":workspace"': "workspace-write"}
+
+
+def _pin(argv: list[str]) -> str:
+    """The one sandbox a spawned Codex was held to, in either form: --sandbox,
+    or the permission profile an MXC sandbox is pinned through."""
+    pins = [argv[i + 1] for i, a in enumerate(argv) if a == "--sandbox"]
+    name = _profile(argv)
+    if name is not None:
+        extends = f"permissions.{name}.extends="
+        pins += [_BUILT_INS[o[len(extends):]] for o in _overrides(argv) if o.startswith(extends)]
+    assert len(pins) == 1, argv
+    return pins[0]
+
+
+REAL_LOCALAPPDATA = r"C:\Users\you\AppData\Local"
+
+
+DECOY = str(adapters._CODEX_DECOY_LOCALAPPDATA)
+
+
+@pytest.fixture
+def windows(monkeypatch):
+    """Windows, the default sandbox, and a known LOCALAPPDATA."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    monkeypatch.delenv("HARDLINE_CODEX_WINDOWS_SANDBOX", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", REAL_LOCALAPPDATA)
+
+
+@pytest.fixture
+def elevated(windows, monkeypatch):
+    """Windows with the elevated sandbox chosen over the MXC default."""
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", "elevated")
+
+
+def _restored(argv: list[str]) -> list[str]:
+    return [a for a in argv if a.startswith("shell_environment_policy.set.")]
+
+
+@pytest.mark.parametrize("effort", ["default", "high"])  # plain and structured paths
+def test_ask_codex_on_windows_runs_the_elevated_sandbox_past_the_runtimes(
+    monkeypatch, elevated, effort
+):
+    """#47: Codex 0.161.0's elevated sandbox refused every command while the
+    desktop app ran its computer-use runtime, because its refresh walks
+    LOCALAPPDATA's runtime tree. The child gets a LOCALAPPDATA that does not
+    exist, which the refresh skips, and its commands get the real one back."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("summarize", effort=effort)
+    argv, env = calls[0]["cmd"], calls[0]["kwargs"]["env"]
+    assert _windows_sandbox(argv) == ['windows.sandbox="elevated"']
+    assert not [a for a in argv if a.startswith("permissions.")]  # it would not hold
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert env["LOCALAPPDATA"] == DECOY
+    assert _restored(argv) == [
+        r'shell_environment_policy.set.LOCALAPPDATA="C:\\Users\\you\\AppData\\Local"'
+    ]
+    assert argv[argv.index(_restored(argv)[0]) - 1] == "-c"
+
+
+@pytest.mark.parametrize("value", ["mxc", "unelevated", "inherit"])
+def test_only_the_elevated_sandbox_is_redirected(monkeypatch, windows, value):
+    """The others do not run the refresh hardline steers around."""
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", value)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _restored(calls[0]["cmd"]) == []
+    assert calls[0]["kwargs"]["env"]["LOCALAPPDATA"] == REAL_LOCALAPPDATA
+
+
+def test_no_redirect_without_a_real_localappdata_to_give_back(monkeypatch, elevated):
+    """Redirected, the commands would keep the decoy."""
+    monkeypatch.delenv("LOCALAPPDATA")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _windows_sandbox(calls[0]["cmd"]) == ['windows.sandbox="elevated"']
+    assert _restored(calls[0]["cmd"]) == []
+    assert "LOCALAPPDATA" not in calls[0]["kwargs"]["env"]
+
+
+def test_windows_detection_is_the_real_platform():
+    """Every other sandbox test forces _ON_WINDOWS; this one pins it to the host,
+    so Windows CI fails if detection ever stops selecting the override."""
+    import os
+
+    assert adapters._ON_WINDOWS is (os.name == "nt")
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"write": True}, {"mode": "advisory"}], ids=["write", "advisory"]
+)
+def test_the_windows_sandbox_reaches_write_and_advisory(
+    monkeypatch, tmp_path, elevated, allow_write, kwargs
+):
+    """Advisory builds an environment of its own; the decoy lands in it."""
+    advisory_env = {"CODEX_HOME": str(tmp_path / "home"), "LOCALAPPDATA": REAL_LOCALAPPDATA}
+    monkeypatch.setattr(
+        adapters, "_prepare_codex_advisory", lambda: (None, advisory_env, str(tmp_path))
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    workdir = None if kwargs.get("mode") == "advisory" else str(tmp_path)
+    adapters.ask_codex("go", workdir=workdir, **kwargs)
+    (spawn,) = calls
+    assert _windows_sandbox(spawn["cmd"]) == ['windows.sandbox="elevated"']
+    assert spawn["kwargs"]["env"]["LOCALAPPDATA"] == DECOY
+    if kwargs.get("mode") == "advisory":
+        assert spawn["kwargs"]["env"]["CODEX_HOME"] == advisory_env["CODEX_HOME"]
+
+
+def _access(argv: list[str]) -> dict[str, str]:
+    """The filesystem table of the profile an MXC sandbox is pinned through."""
+    prefix = f"permissions.{_profile(argv)}.filesystem="
+    (table,) = [o[len(prefix):] for o in _overrides(argv) if o.startswith(prefix)]
+    # Each key is a TOML basic string, which JSON reads the same for paths.
+    return {json.loads(k): v for k, v in re.findall(r'("(?:[^"\\]|\\.)*")="(\w+)"', table)}
+
+
+@pytest.fixture
+def secret_home(monkeypatch, tmp_path):
+    """A home, Codex home, gh home and store of known paths, each in a
+    directory that exists, as on a host that has used them."""
+    home = tmp_path / "user"
+    for directory in (home / "codex", home / "roaming", home / ".cache", tmp_path / "store"):
+        directory.mkdir(parents=True)
+    monkeypatch.setattr(adapters.Path, "home", classmethod(lambda cls: home))
+    for name in ("CLAUDE_CONFIG_DIR", "GH_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("APPDATA", str(home / "roaming"))
+    monkeypatch.setenv("CODEX_HOME", str(home / "codex"))
+    monkeypatch.setenv("HARDLINE_DB", str(tmp_path / "store" / "mb.db"))
+    return home
+
+
+def _denies(access: dict[str, str], paths) -> bool:
+    return all(access.get(str(path)) == "deny" for path in paths)
+
+
+def test_ask_codex_on_windows_pins_mxc_with_the_secrets_denied(monkeypatch, windows, secret_home):
+    """The default: MXC enforces a profile in the one process it starts, so the
+    read-only pin denies the secrets per call without touching a DACL every
+    Codex session shares - and needs no decoy, since it runs no refresh."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    argv, env = calls[0]["cmd"], calls[0]["kwargs"]["env"]
+    assert _windows_sandbox(argv) == ['windows.sandbox="mxc"']
+    assert "--sandbox" not in argv
+    assert _pin(argv) == "read-only"
+    assert env["LOCALAPPDATA"] == REAL_LOCALAPPDATA
+    store, codex = secret_home.parent / "store", secret_home / "codex"
+    access = _access(argv)
+    assert _denies(access, [
+        secret_home / ".claude", secret_home / ".claude.json",
+        codex / ".env", codex / "auth.json", codex / "config.toml", codex / "sessions",
+        codex / "archived_sessions", codex / "history.jsonl",
+        secret_home / "roaming" / "GitHub CLI",
+        secret_home / ".cache" / "hardline-mcp",
+        store / "mb.db", store / "mb.db-wal", store / "mb.db-shm",
+        secret_home / ".ssh",
+    ])
+    assert set(access.values()) == {"deny"}
+
+
+def test_every_call_names_a_profile_no_configuration_layer_can_reach(
+    monkeypatch, windows, secret_home
+):
+    """Codex deep-merges its layers: a [permissions.<name>] table in a trusted
+    project's .codex/config.toml would merge into a profile of a known name
+    and could re-grant what it denies."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    adapters.ask_codex("summarize")
+    first, second = (_profile(call["cmd"]) for call in calls)
+    assert first != second
+    assert re.fullmatch(r"hardline-[0-9a-f]{16}", first)
+
+
+def test_a_relocated_store_is_denied_where_it_resolves(monkeypatch, windows, secret_home, tmp_path):
+    """HARDLINE_DB may be relative; Codex is given the path it names."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rel").mkdir()
+    monkeypatch.setenv("HARDLINE_DB", "rel/mb.db")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    access = _access(calls[0]["cmd"])
+    assert all(os.path.isabs(path) for path in access)
+    assert _denies(access, [tmp_path / "rel" / "mb.db"])
+
+
+def test_both_claude_homes_are_denied(monkeypatch, windows, secret_home, tmp_path):
+    """A relocated Claude home does not prove the default one empty."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _denies(_access(calls[0]["cmd"]), [tmp_path / "claude-home", secret_home / ".claude"])
+
+
+def test_every_home_gh_may_use_is_denied(monkeypatch, windows, secret_home, tmp_path):
+    """gh reads GH_CONFIG_DIR, else $XDG_CONFIG_HOME/gh, else %APPDATA%\\GitHub CLI
+    on Windows, else ~/.config/gh; the one in use does not prove the others
+    empty, and off Windows the token is in the last two."""
+    for directory in (tmp_path / "xdg", secret_home / ".config"):
+        directory.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh-dir"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _denies(_access(calls[0]["cmd"]), [
+        tmp_path / "gh-dir", tmp_path / "xdg" / "gh",
+        secret_home / "roaming" / "GitHub CLI", secret_home / ".config" / "gh",
+    ])
+
+
+def _link(target, link):
+    """A second name for ``target``: a junction on Windows, a symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def test_a_denied_directory_reached_through_a_link_is_denied_by_both_names(
+    monkeypatch, windows, secret_home, tmp_path
+):
+    """Under its link spelling the denial may never match the directory the
+    reviewer reads, so its resolved spelling is denied too."""
+    real = tmp_path / "elsewhere" / "ssh"
+    real.mkdir(parents=True)
+    secret_home.mkdir(parents=True, exist_ok=True)
+    _link(real, secret_home / ".ssh")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _denies(_access(calls[0]["cmd"]), [secret_home / ".ssh", real])
+
+
+def test_advisory_denies_its_copy_of_the_codex_login_too(
+    monkeypatch, tmp_path, windows, secret_home
+):
+    """Advisory copies auth.json into a temporary Codex home of its own."""
+    copy = tmp_path / "advisory" / "codex-home"
+    copy.mkdir(parents=True)
+    monkeypatch.setattr(
+        adapters, "_prepare_codex_advisory",
+        lambda: (None, {**os.environ, "CODEX_HOME": str(copy)}, str(tmp_path / "advisory")),
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("go", mode="advisory")
+    argv = calls[0]["cmd"]
+    assert _pin(argv) == "read-only"
+    access = _access(argv)
+    assert _denies(access, [copy / "auth.json", secret_home / "codex" / "auth.json"])
+
+
+def test_mxc_write_pins_the_workspace_profile(monkeypatch, tmp_path, windows, secret_home, allow_write):
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("fix it", workdir=str(tmp_path), write=True)
+    argv = calls[0]["cmd"]
+    assert _pin(argv) == "workspace-write"
+    assert 'approval_policy="never"' in _overrides(argv)
+    assert set(_access(argv).values()) == {"deny"}  # the workdir is no secret's
+
+
+@pytest.mark.parametrize(("write", "kept"), [(False, "read"), (True, "write")])
+def test_a_workdir_inside_a_denied_directory_stays_usable(
+    monkeypatch, windows, secret_home, allow_write, write, kept
+):
+    """Reviewing ~/.claude/skills must not mean reading nothing: the workdir's
+    own entry is more specific than the denial, and Codex's most specific
+    entry wins (measured under MXC)."""
+    skills = secret_home / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("review", workdir=str(skills), write=write)
+    access = _access(calls[0]["cmd"])
+    assert access.get(str(skills)) == kept
+    assert _denies(access, [secret_home / ".claude"])
+
+
+def test_a_denied_directory_as_the_workdir_stays_denied(monkeypatch, windows, secret_home):
+    """Equally specific, so not an exception: reviewing ~/.claude itself would
+    hand the reviewer the credentials inside it."""
+    (secret_home / ".ssh").mkdir(parents=True)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("review", workdir=str(secret_home / ".ssh"))
+    assert _access(calls[0]["cmd"]).get(str(secret_home / ".ssh")) == "deny"
+
+
+def test_a_denial_under_a_missing_directory_denies_that_directory(
+    monkeypatch, windows, secret_home, tmp_path
+):
+    """MXC refuses to start over a denial whose parent does not exist
+    (measured on 0.162.1). The topmost missing directory is denied instead:
+    nothing in it exists to hide, and whatever appears there stays denied."""
+    monkeypatch.setenv("HARDLINE_DB", str(tmp_path / "gone" / "deeper" / "mb.db"))
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    access = _access(calls[0]["cmd"])
+    assert _denies(access, [tmp_path / "gone"])
+    assert not [path for path in access if path.startswith(str(tmp_path / "gone") + os.sep)]
+
+
+@pytest.mark.parametrize(
+    "name", ["x\udcff", "a[1]", "a*", "a?"], ids=["not-toml", "glob", "star", "question"]
+)
+def test_a_denial_codex_cannot_be_given_exactly_refuses_the_call(
+    monkeypatch, windows, secret_home, tmp_path, name
+):
+    """Dropped, or read by Codex as a glob matching something else, the entry
+    would hand over what the caller believes is denied."""
+    monkeypatch.setattr(adapters, "_codex_unreadable", lambda env, clean=False: [tmp_path / name])
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask_codex("summarize")
+    assert out["ok"] is False
+    assert "cannot give Codex" in out["error"]
+    assert calls == []
+
+
+@pytest.fixture
+def sandbox_probe(monkeypatch):
+    """Records each `codex sandbox` preflight; set ``result`` to vary it."""
+
+    class Probe:
+        calls = []
+        result = {"ok": True}
+
+    def started(exe, overrides, env, cwd, on_spawn=None, clean=False):
+        Probe.calls.append(
+            {"exe": exe, "overrides": overrides, "env": env, "cwd": cwd, "clean": clean}
+        )
+        return Probe.result
+
+    monkeypatch.setattr(adapters, "_codex_sandbox_started", started)
+    return Probe
+
+
+def test_mxc_is_proven_with_the_calls_own_sandbox_and_pin_first(
+    monkeypatch, tmp_path, windows, secret_home, sandbox_probe
+):
+    """Where Windows cannot provide MXC, `codex exec` starts no command and
+    reports no failed one, so the call would read as a finished review."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("review", workdir=str(tmp_path))
+    (probe,), argv = sandbox_probe.calls, calls[0]["cmd"]
+    assert probe["exe"] == argv[0]
+    assert probe["cwd"] == calls[0]["kwargs"]["cwd"]
+    assert probe["env"] == calls[0]["kwargs"]["env"]
+    sandbox, pin = probe["overrides"][:2], probe["overrides"][2:]
+    assert sandbox == ["-c", 'windows.sandbox="mxc"']
+    assert _profile(pin) == _profile(argv)
+    assert any(argv[i : i + len(pin)] == pin for i in range(len(argv)))
+
+
+def test_an_mxc_that_starts_nothing_refuses_the_call(
+    monkeypatch, windows, secret_home, sandbox_probe
+):
+    sandbox_probe.result = {"ok": False, "error": "MXC launcher: native MXC is unavailable"}
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask_codex("summarize")
+    assert out["ok"] is False
+    assert "native MXC is unavailable" in out["error"]
+    assert "HARDLINE_CODEX_WINDOWS_SANDBOX=elevated" in out["error"]
+    assert calls == []
+
+
+def test_a_cancel_during_the_mxc_preflight_stops_the_call(
+    monkeypatch, windows, secret_home, sandbox_probe
+):
+    sandbox_probe.result = {"ok": False, "cancelled": True, "error": "cancelled"}
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask_codex("summarize")
+    assert out.get("cancelled") is True
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", ["elevated", "unelevated", "inherit"])
+def test_only_mxc_is_preflighted(monkeypatch, windows, sandbox_probe, value):
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", value)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert sandbox_probe.calls == []
+    assert len(calls) == 1
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert _profile(argv) is None
+
+
+@pytest.mark.parametrize("value", ["mxc", "elevated", "unelevated", "inherit", "posix"])
+def test_every_sandbox_keeps_credentials_out_of_commands(
+    monkeypatch, windows, secret_home, sandbox_probe, value
+):
+    """No file denial reaches an environment variable, and Codex leaves its
+    default excludes off unless asked; where there is a preflight, the probe
+    is asked the same."""
+    if value == "posix":
+        monkeypatch.setattr(adapters, "_ON_WINDOWS", False)
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", value)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    for argv in [calls[0]["cmd"], *(probe["overrides"] for probe in sandbox_probe.calls)]:
+        assert ("-c", "shell_environment_policy.ignore_default_excludes=false") in zip(argv, argv[1:])
+    assert len(sandbox_probe.calls) == (value in ("mxc", "posix"))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", ['windows.sandbox="mxc"']),
+        ("elevated", ['windows.sandbox="elevated"']),
+        ("inherit", []),
+        (" Unelevated ", ['windows.sandbox="unelevated"']),
+    ],
+)
+def test_ask_codex_windows_sandbox_is_configurable(monkeypatch, value, expected):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", value)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _windows_sandbox(calls[0]["cmd"]) == expected
+
+
+def test_ask_codex_rejects_an_unknown_windows_sandbox_before_spawning(monkeypatch):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", "unelevate")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask_codex("summarize")
+    assert out["ok"] is False
+    assert "HARDLINE_CODEX_WINDOWS_SANDBOX" in out["error"]
+    assert calls == []
+
+
+def test_an_unknown_windows_sandbox_refuses_before_model_resolution(monkeypatch):
+    """A family model resolves through `codex debug models`, and async admission
+    resolves before it queues: the shared validator must refuse first."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", "unelevate")
+
+    def no_resolution(*args, **kwargs):
+        raise AssertionError("resolved a model despite an invalid configuration")
+
+    monkeypatch.setattr(adapters, "resolve_codex_model", no_resolution)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    error, _ = adapters.validate_request(
+        "codex", model="sol", effort="default", mode="default", workdir=None, write=False
+    )
+    assert error is not None and "HARDLINE_CODEX_WINDOWS_SANDBOX" in error["error"]
+    out = adapters.ask_codex("summarize", model="sol")
+    assert out["ok"] is False and "HARDLINE_CODEX_WINDOWS_SANDBOX" in out["error"]
+    assert calls == []
+
+
+def test_off_windows_the_pin_is_the_same_profile_with_no_windows_sandbox(
+    monkeypatch, secret_home, sandbox_probe
+):
+    """bubblewrap and Seatbelt enforce the profile too, per process
+    (tests/test_live_sandbox.py), and there is no Windows sandbox to pick."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", False)
+    monkeypatch.setenv("HARDLINE_CODEX_WINDOWS_SANDBOX", "elevated")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    argv = calls[0]["cmd"]
+    assert _windows_sandbox(argv) == []
+    assert "--sandbox" not in argv
+    assert _pin(argv) == "read-only"
+    assert _denies(_access(argv), [secret_home / ".claude", secret_home / ".ssh"])
+    (probe,) = sandbox_probe.calls
+    assert _profile(probe["overrides"]) == _profile(argv)
+
+
+def test_off_windows_a_sandbox_that_starts_nothing_refuses_without_windows_advice(
+    monkeypatch, secret_home, sandbox_probe
+):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", False)
+    sandbox_probe.result = {"ok": False, "error": "bwrap: Can't chdir"}
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask_codex("summarize")
+    assert out["ok"] is False and "bwrap: Can't chdir" in out["error"]
+    assert "MXC" not in out["error"] and "HARDLINE_CODEX_WINDOWS_SANDBOX" not in out["error"]
+    assert calls == []
+
+
+def test_the_preflight_probes_the_workdir_and_every_existing_denial(
+    monkeypatch, secret_home, tmp_path
+):
+    """Inside the call's own sandbox, so it proves the policy that holds, not
+    the one passed: a requirements file can swap the profile out."""
+    (secret_home / ".ssh").mkdir()
+    monkeypatch.setenv("HARDLINE_TEST_GH_TOKEN", "dummy")
+    seen, envs = [], []
+    monkeypatch.setattr(
+        adapters, "_run_cmd",
+        lambda argv, env, **kwargs: seen.append(argv) or envs.append(env) or {"ok": True},
+    )
+    # Codex given an environment without one of hardline's credentials, which
+    # a `set` could still put back: it is withheld too.
+    codex_env = {k: v for k, v in os.environ.items() if k != "HARDLINE_TEST_GH_TOKEN"}
+    _real_sandbox_started("codex", ["-c", "x=1"], codex_env, str(tmp_path))
+    (argv,) = seen
+    assert argv[:9] == [
+        "codex", "sandbox", "-c", "x=1", "--",
+        sys.executable, "-I", "-c", adapters._CODEX_POLICY_PROBE,
+    ]
+    assert argv[9] == str(tmp_path)
+    cut = argv.index("--", 10)
+    withheld, denied = argv[10:cut], argv[cut + 1:]
+    # Every credential-named variable Codex holds, a canary always among them.
+    assert {"HARDLINE_TEST_GH_TOKEN", adapters._CODEX_ENV_CANARY} <= set(withheld)
+    assert "HARDLINE_TEST_GH_TOKEN" not in envs[0] and envs[0].get(adapters._CODEX_ENV_CANARY)
+    canary = secret_home / ".cache" / "hardline-mcp" / "sandbox-canary"
+    assert denied[0] == str(canary) and canary.is_file()  # never a policy denying nothing
+    assert str(secret_home / ".ssh") in denied
+    assert all(os.path.exists(path) for path in denied)  # a missing one proves nothing
+
+
+def test_the_preflight_loads_managed_requirements_as_exec_does(monkeypatch, secret_home, tmp_path):
+    """`codex sandbox` fetches the cloud requirements bundle only for a profile
+    named with --permission-profile and --include-managed-config, while
+    `codex exec` always applies it, and a bundle can reject the profile."""
+    seen = []
+    monkeypatch.setattr(adapters, "_run_cmd", lambda argv, **kwargs: seen.append(argv) or {"ok": True})
+    pin = ["-c", 'default_permissions="hardline-0123"', "-c", "x=1"]
+    _real_sandbox_started("codex", pin, dict(os.environ), str(tmp_path))
+    (argv,) = seen
+    assert argv[:7] == ["codex", "sandbox", "--permission-profile", "hardline-0123",
+                        "--include-managed-config", *pin[:2]]
+
+
+@pytest.mark.parametrize(
+    ("workdir", "denied", "inherited", "refusal"),
+    [
+        ("project", [], [], None),
+        ("project", ["secret.txt"], [], "denied paths still open"),
+        ("project", ["secrets"], [], "denied paths still open"),
+        ("nowhere", [], [], "cannot read the workdir"),
+        ("project", [], ["HARDLINE_TEST_GH_TOKEN"],
+         "credentials in Codex's environment still reach its commands: HARDLINE_TEST_GH_TOKEN"),
+    ],
+    ids=["holds", "file-open", "directory-open", "workdir-unreadable", "credential-inherited"],
+)
+def test_the_policy_probe(tmp_path, workdir, denied, inherited, refusal):
+    """Run unsandboxed here, where every existing path opens. A withheld name
+    the canary's policy let through, as an `include_only` naming it would."""
+    (tmp_path / "project").mkdir()
+    (tmp_path / "secret.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "secrets").mkdir()
+    withheld = [adapters._CODEX_ENV_CANARY, "HARDLINE_TEST_GH_TOKEN"]
+    env = {k: v for k, v in os.environ.items() if k not in withheld}
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", adapters._CODEX_POLICY_PROBE, str(tmp_path / workdir),
+         *withheld, "--", *(str(tmp_path / name) for name in denied)],
+        capture_output=True, text=True, timeout=30,
+        env={**env, **dict.fromkeys(inherited, "dummy")},
+    )
+    assert (out.returncode == 0) is (refusal is None), out.stderr
+    assert refusal is None or refusal in out.stderr
+
+
+def test_a_codex_home_is_denied_but_for_what_a_reviewer_uses(monkeypatch, windows, secret_home):
+    """Its secrets change names between releases (state_5.sqlite holds each
+    thread's first message; the elevated sandbox logs command lines under
+    .sandbox), so every entry is denied but the instructions, skills, helper
+    binaries and scratch space - and the provisioning guard file, which MXC
+    cannot deny while Codex holds it, but no directory dressed as one."""
+    codex = secret_home / "codex"
+    for name in ("state_5.sqlite", "logs_2.sqlite", "dictation-history", ".sandbox",
+                 "fake.guard", ".codex-provisioning-2.guard", "skills", ".sandbox-bin", "tmp"):
+        (codex / name).mkdir()
+    for name in ("AGENTS.md", ".sqlite-maintenance.lock", "other.guard", ".codex-provisioning-1.guard"):
+        (codex / name).write_text("", encoding="utf-8")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    access = _access(calls[0]["cmd"])
+    assert _denies(access, [codex / name for name in (
+        "state_5.sqlite", "logs_2.sqlite", "dictation-history", ".sandbox",
+        "fake.guard", "other.guard", ".codex-provisioning-2.guard", ".sqlite-maintenance.lock",
+    )])
+    for kept in ("AGENTS.md", "skills", ".sandbox-bin", "tmp", ".codex-provisioning-1.guard"):
+        assert str(codex / kept) not in access
+
+
+def test_a_codex_home_that_cannot_be_listed_refuses_the_call(monkeypatch, windows, secret_home):
+    """Denying only the names known today would leave the rest readable."""
+    real = os.listdir
+
+    def listdir(path):
+        if adapters.Path(path) == secret_home / "codex":
+            raise PermissionError("denied")
+        return real(path)
+
+    monkeypatch.setattr(adapters.os, "listdir", listdir)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    out = adapters.ask_codex("summarize")
+    assert out["ok"] is False and "cannot list" in out["error"]
+    assert calls == []
+
+
+def test_the_default_codex_home_is_denied_beside_a_relocated_one(monkeypatch, windows, secret_home):
+    (secret_home / ".codex").mkdir()
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_reply("codex reply")))
+    adapters.ask_codex("summarize")
+    assert _denies(_access(calls[0]["cmd"]), [
+        secret_home / ".codex" / "auth.json", secret_home / "codex" / "auth.json",
+    ])
+
+
+def test_ask_codex_ignores_transient_error_before_completed_turn(monkeypatch):
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-retried"},
+        {"type": "error", "message": "transient failure; retrying"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "answer"}},
+        {"type": "turn.completed", "usage": {"output_tokens": 1}},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is True
+    assert out["reply"] == "answer"
+    assert out["thread_id"] == "thread-retried"
+
+
+def test_ask_codex_reports_structured_turn_failure(monkeypatch):
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "thread-failed"},
+        {"type": "turn.failed", "error": {"message": "usage limit reached"}},
+    )
+    _capture_run(
+        monkeypatch,
+        _FakeCompleted(stdout=stdout, stderr="codex failed", returncode=1),
+    )
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is False
+    assert "usage limit reached" in out["error"]
+    assert out["thread_id"] == "thread-failed"
+
+
+def test_ask_codex_advisory_fails_before_spawn_without_chatgpt_auth(
+    monkeypatch, tmp_path
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": "apikey", "tokens": {"access_token": "secret"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_codex("review", mode="advisory")
+
+    assert out["ok"] is False
+    assert out["subscription_configured"] is False
+    assert out["subscription_verified"] is None
+    assert "ChatGPT" in out["error"]
+    assert calls == []
+
+
+def test_ask_codex_advisory_cleans_up_when_auth_copy_fails(monkeypatch, tmp_path):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": "chatgpt"}), encoding="utf-8"
+    )
+    neutral_root = tmp_path / "neutral-root"
+    neutral_root.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(adapters.tempfile, "mkdtemp", lambda prefix: str(neutral_root))
+    monkeypatch.setattr(
+        adapters.shutil,
+        "copyfile",
+        lambda *_: (_ for _ in ()).throw(PermissionError("copy denied")),
+    )
+    removed = []
+    monkeypatch.setattr(
+        adapters.shutil,
+        "rmtree",
+        lambda path, ignore_errors: removed.append((path, ignore_errors)),
+    )
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_codex("review", mode="advisory")
+
+    assert out["ok"] is False
+    assert "isolated Codex advisory home" in out["error"]
+    assert "copy denied" in out["error"]
+    assert calls == []
+    assert removed == [(str(neutral_root), True)]
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_ask_claude_routes_model_and_effort(monkeypatch, effort):
+    monkeypatch.delenv("HARDLINE_CLAUDE_TIMEOUT_S", raising=False)
+    stdout = _claude_stream(
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-fable-5",
+            "apiKeySource": "none",
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "answer"}],
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "result": "answer",
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "modelUsage": {"claude-fable-5": {"inputTokens": 2, "outputTokens": 1}},
+        },
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("review this", model="fable", effort=effort)
+
+    assert out["ok"] is True
+    assert out["reply"] == "answer"
+    assert out["requested_model"] == "fable"
+    assert out["actual_model"] == "claude-fable-5"
+    assert out["requested_effort"] == effort
+    assert out["effective_effort"] is None  # Claude does not echo this value.
+    assert out["api_key_source"] == "none"
+    assert out["usage"]["input_tokens"] == 2
+    argv = calls[0]["cmd"]
+    assert argv[0] == "claude"
+    assert argv[1] == "-p"
+    assert argv[argv.index("--model") + 1] == "fable"
+    assert argv[argv.index("--effort") + 1] == effort
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in argv
+    assert argv[-1] == "review this"
+    # A streaming run: the long ceiling, judged by silence (_run_cmd's idle_s).
+    assert calls[0]["kwargs"]["timeout"] == adapters._STREAMING_TIMEOUT_S
+
+
+def test_ask_claude_default_effort_omits_flag(monkeypatch):
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-sonnet-5"},
+        {"type": "result", "subtype": "success", "result": "ok"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("hello", model="sonnet", effort="default")
+
+    assert out["ok"] is True
+    assert "--effort" not in calls[0]["cmd"]
+    assert out["requested_effort"] == "default"
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "ultra", "", "HIGH"])
+def test_ask_claude_rejects_unsupported_effort(monkeypatch, effort):
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_claude("hello", model="fable", effort=effort)
+
+    assert out["ok"] is False
+    assert "effort" in out["error"].lower()
+    assert calls == []
+
+
+def test_ask_claude_reports_refusal_fallback(monkeypatch):
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5"},
+        {
+            "type": "system",
+            "subtype": "model_refusal_fallback",
+            "original_model": "claude-fable-5",
+            "fallback_model": "claude-opus-4-8",
+            "api_refusal_category": "cyber",
+        },
+        {"type": "assistant", "message": {"model": "claude-opus-4-8", "content": []}},
+        {"type": "result", "subtype": "success", "result": "fallback answer"},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("review", model="fable", effort="high")
+
+    assert out["ok"] is True
+    assert out["actual_model"] == "claude-opus-4-8"
+    assert out["fallback"] == {
+        "type": "model_refusal_fallback",
+        "original_model": "claude-fable-5",
+        "fallback_model": "claude-opus-4-8",
+        "category": "cyber",
+    }
+
+
+def test_ask_claude_advisory_isolates_context_and_api_overrides(monkeypatch, tmp_path):
+    for name in adapters._CLAUDE_AUTH_OVERRIDE_ENV:
+        monkeypatch.setenv(name, "must-not-leak")
+    stdout = _claude_stream(
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-fable-5",
+            "apiKeySource": "none",
+        },
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {"isUsingOverage": False, "rateLimitType": "seven_day"},
+        },
+        {"type": "result", "subtype": "success", "result": "ok"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+    monkeypatch.setattr(adapters.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+
+    out = adapters.ask_claude("review", model="fable", effort="high", mode="advisory")
+
+    assert out["ok"] is True
+    assert out["subscription_verified"] is True
+    argv = calls[0]["cmd"]
+    assert "--safe-mode" in argv
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "--disable-slash-commands" in argv
+    assert "--no-session-persistence" in argv
+    assert "--system-prompt" in argv
+    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+    child_env = calls[0]["kwargs"]["env"]
+    assert all(name not in child_env for name in adapters._CLAUDE_AUTH_OVERRIDE_ENV)
+
+
+@pytest.mark.parametrize(
+    ("api_key_source", "rate_limit"),
+    [
+        ("environment", {"isUsingOverage": False}),
+        ("none", {"isUsingOverage": True}),
+        ("none", None),
+    ],
+)
+def test_ask_claude_advisory_fails_closed_without_base_subscription_evidence(
+    monkeypatch, tmp_path, api_key_source, rate_limit
+):
+    events = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-fable-5",
+            "apiKeySource": api_key_source,
+        }
+    ]
+    if rate_limit is not None:
+        events.append({"type": "rate_limit_event", "rate_limit_info": rate_limit})
+    events.append({"type": "result", "subtype": "success", "result": "ok"})
+    _capture_run(monkeypatch, _FakeCompleted(stdout=_claude_stream(*events)))
+    monkeypatch.setattr(adapters.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+
+    out = adapters.ask_claude("review", model="fable", mode="advisory")
+
+    assert out["ok"] is False
+    assert out["subscription_verified"] is False
+    assert "subscription" in out["error"].lower()
+
+
+def test_ask_claude_rejects_unknown_mode(monkeypatch):
+    calls = _capture_run(monkeypatch)
+    out = adapters.ask_claude("hello", mode="unsafe")
+    assert out["ok"] is False
+    assert "mode" in out["error"].lower()
+    assert calls == []
+
+
+def _quota_snapshot(*, claude_remaining, chatgpt_remaining):
+    return {
+        "providers": {
+            "claude": {
+                "status": "available",
+                "weekly": {
+                    "remaining_percent": claude_remaining,
+                    "reset_at_utc": "2026-08-21T00:00:00+00:00",
+                },
+            },
+            "chatgpt": {
+                "status": "available",
+                "weekly": {
+                    "remaining_percent": chatgpt_remaining,
+                    "reset_at_utc": "2026-08-27T03:31:34+00:00",
+                },
+            },
+        }
+    }
+
+
+def _enable_quota_router(monkeypatch, snapshot):
+    monkeypatch.setenv("HARDLINE_QUOTA_ROUTER_COMMAND_JSON", '["quota-router"]')
+    monkeypatch.setenv("HARDLINE_CLAUDE_WEEKLY_RESERVE_PERCENT", "5")
+    monkeypatch.setattr(adapters, "_fetch_subscription_quota", lambda: snapshot)
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+def test_nonfinite_quota_config_uses_bounded_default(monkeypatch, raw):
+    monkeypatch.setenv("HARDLINE_CLAUDE_WEEKLY_RESERVE_PERCENT", raw)
+
+    assert adapters._quota_env_float(
+        "HARDLINE_CLAUDE_WEEKLY_RESERVE_PERCENT", 5.0
+    ) == 5.0
+
+
+def test_quota_router_detaches_inherited_mcp_stdin(monkeypatch):
+    """The long-lived MCP pipe must not reach the quota collector on Windows.
+
+    Python 3.11 can stall during child interpreter initialization while probing
+    an inherited stdio handle.  The collector then appears to be a slow quota
+    endpoint even though it has not reached provider telemetry at all.
+    """
+    monkeypatch.setenv("HARDLINE_QUOTA_ROUTER_COMMAND_JSON", '["quota-router"]')
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured.update(argv=argv, kwargs=kwargs)
+        return _FakeCompleted(stdout='{"providers": {}}')
+
+    monkeypatch.setattr(adapters.subprocess, "run", fake_run)
+
+    assert adapters._fetch_subscription_quota() == {"providers": {}}
+    assert captured["argv"] == ["quota-router"]
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["close_fds"] is True
+
+
+def test_quota_router_output_is_decoded_as_utf8_not_the_locale_codepage(monkeypatch):
+    """Windows decodes text=True as cp1252, where 0x8d is undefined: a UTF-8
+    collector emitting U+014D would crash the decode. Name the encoding."""
+    monkeypatch.setenv("HARDLINE_QUOTA_ROUTER_COMMAND_JSON", '["quota-router"]')
+    raw = '{"providers": {"note": "ō"}}'.encode("utf-8")
+
+    def fake_run(argv, **kwargs):
+        try:
+            text = raw.decode(kwargs.get("encoding") or "cp1252", kwargs.get("errors", "strict"))
+        except UnicodeDecodeError as exc:
+            raise AssertionError(f"the collector's output was decoded wrongly: {exc}")
+        return _FakeCompleted(stdout=text)
+
+    monkeypatch.setattr(adapters.subprocess, "run", fake_run)
+
+    assert adapters._fetch_subscription_quota() == {"providers": {"note": "ō"}}
+
+
+def test_ask_claude_redirects_to_chatgpt_when_it_has_more_weekly_quota(monkeypatch):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=2, chatgpt_remaining=86),
+    )
+    decision = adapters._claude_quota_route(require_claude=False)
+
+    assert decision["requested_provider"] == "claude"
+    assert decision["selected_provider"] == "chatgpt"
+    assert decision["claude_remaining_percent"] == 2
+    assert decision["chatgpt_remaining_percent"] == 86
+
+
+def test_required_claude_is_refused_below_reserve_instead_of_consuming(monkeypatch):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=2, chatgpt_remaining=86),
+    )
+    decision = adapters._claude_quota_route(require_claude=True)
+
+    assert decision["selected_provider"] is None
+    assert decision["reserve_enforced"] is True
+    assert "reserve" in decision["reason"].lower()
+
+
+def test_required_claude_explicit_reserve_override_bypasses_floor(monkeypatch):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=2, chatgpt_remaining=86),
+    )
+
+    decision = adapters._claude_quota_route(
+        require_claude=True,
+        override_claude_reserve=True,
+        override_reason="Owner approved this one review in the current task.",
+    )
+
+    assert decision["selected_provider"] == "claude"
+    assert decision["reserve_enforced"] is False
+    assert decision["reserve_override"] == {
+        "requested": True,
+        "applied": True,
+        "reason": "Owner approved this one review in the current task.",
+        "authority": "caller_asserted",
+    }
+
+
+def test_reserve_override_never_bypasses_telemetry_failure(monkeypatch):
+    monkeypatch.setenv("HARDLINE_QUOTA_ROUTER_COMMAND_JSON", '["quota-router"]')
+    monkeypatch.setattr(
+        adapters,
+        "_fetch_subscription_quota",
+        lambda: (_ for _ in ()).throw(RuntimeError("telemetry unavailable")),
+    )
+
+    decision = adapters._claude_quota_route(
+        require_claude=True,
+        override_claude_reserve=True,
+        override_reason="Owner approved this one review in the current task.",
+    )
+
+    assert decision["selected_provider"] is None
+    assert decision["quota_status"] == "unavailable"
+    assert decision["reserve_override"]["requested"] is True
+    assert decision["reserve_override"]["applied"] is False
+
+
+def test_reserve_override_never_bypasses_exhausted_allowance(monkeypatch):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=0, chatgpt_remaining=86),
+    )
+
+    decision = adapters._claude_quota_route(
+        require_claude=True,
+        override_claude_reserve=True,
+        override_reason="Owner approved this one review in the current task.",
+    )
+
+    assert decision["selected_provider"] is None
+    assert decision["reserve_enforced"] is True
+    assert decision["reserve_override"]["applied"] is False
+    assert "exhausted" in decision["reason"].lower()
+
+
+@pytest.mark.parametrize("malformed", [float("nan"), float("inf"), -1, 101])
+def test_reserve_override_rejects_malformed_numeric_telemetry(monkeypatch, malformed):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=malformed, chatgpt_remaining=86),
+    )
+
+    decision = adapters._claude_quota_route(
+        require_claude=True,
+        override_claude_reserve=True,
+        override_reason="Owner approved this one review in the current task.",
+    )
+
+    assert decision["selected_provider"] is None
+    assert decision["quota_status"] == "unavailable"
+    assert decision["reserve_override"]["applied"] is False
+    assert "finite percentages" in decision["reason"]
+
+
+@pytest.mark.parametrize("boolish", [True, False])
+def test_reserve_override_rejects_boolean_telemetry(monkeypatch, boolish):
+    """``bool`` is a subclass of ``int``, so this passed every numeric check.
+
+    ``float(True)`` is ``1.0`` and lands inside [0, 100], so a snapshot
+    reporting ``true`` authorised spending the reserve as though 1% remained —
+    the opposite of the fail-closed handling malformed telemetry is documented
+    to get.
+    """
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=boolish, chatgpt_remaining=86),
+    )
+
+    decision = adapters._claude_quota_route(
+        require_claude=True,
+        override_claude_reserve=True,
+        override_reason="Owner approved this one review in the current task.",
+    )
+
+    assert decision["selected_provider"] is None
+    assert decision["quota_status"] == "unavailable"
+    assert decision["reserve_override"]["applied"] is False
+
+
+def test_reserve_override_survives_an_unrepresentable_number(monkeypatch):
+    """A valid JSON integer too large for a float must not escape as an exception.
+
+    ``float()`` raises OverflowError there, which was not in the fail-closed
+    branch — so ask_claude raised at the MCP level instead of returning the
+    structured refusal it documents.
+    """
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=10**400, chatgpt_remaining=86),
+    )
+
+    decision = adapters._claude_quota_route(
+        require_claude=True,
+        override_claude_reserve=True,
+        override_reason="Owner approved this one review in the current task.",
+    )
+
+    assert decision["selected_provider"] is None
+    assert decision["quota_status"] == "unavailable"
+    assert "failing closed" in decision["reason"]
+
+
+def test_required_claude_can_run_above_reserve_despite_chatgpt_headroom(monkeypatch):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=20, chatgpt_remaining=86),
+    )
+    decision = adapters._claude_quota_route(require_claude=True)
+
+    assert decision["selected_provider"] == "claude"
+
+
+def test_claude_becomes_preferred_automatically_after_its_reset(monkeypatch):
+    _enable_quota_router(
+        monkeypatch,
+        _quota_snapshot(claude_remaining=99, chatgpt_remaining=86),
+    )
+    decision = adapters._claude_quota_route(require_claude=False)
+
+    assert decision["selected_provider"] == "claude"
+    assert decision["claude_remaining_percent"] == 99
+
+
+def test_quota_lookup_failure_blocks_without_guessing_chatgpt(monkeypatch):
+    monkeypatch.setenv("HARDLINE_QUOTA_ROUTER_COMMAND_JSON", '["quota-router"]')
+    monkeypatch.setattr(
+        adapters,
+        "_fetch_subscription_quota",
+        lambda: (_ for _ in ()).throw(RuntimeError("telemetry unavailable")),
+    )
+    decision = adapters._claude_quota_route(require_claude=False)
+
+    assert decision["selected_provider"] is None
+    assert decision["quota_status"] == "unavailable"
+    assert decision["retry_policy"] == {
+        "unchanged_retry_allowed": False,
+        "retry_after_fresh_telemetry": True,
+        "maximum_retries_after_change": 1,
+        "bypass_allowed": False,
+    }
+
+
+def test_ask_claude_default_denies_edit_write(monkeypatch):
+    # Parity with Codex: safe by default, matching test_ask_codex_write_false_keeps_prior_argv_shape.
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="claude reply"))
+
+    out = adapters.ask("claude", "summarize")
+
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit"
+    assert "--permission-mode" not in argv
+
+
+def test_ask_claude_optioned_call_also_denies_edit_write_by_default(
+    monkeypatch, tmp_path
+):
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5"},
+        {"type": "result", "subtype": "success", "result": "reviewed"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("review", model="fable", workdir=str(tmp_path))
+
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--disallowedTools") + 1] == "Edit,Write,NotebookEdit"
+
+
+def test_read_only_calls_drop_the_host_settings_layer(monkeypatch):
+    """What actually makes read-only read-only.
+
+    Measured, not assumed: with the host's settings loaded, a blanket
+    ``Bash(*)`` permission overrides Claude Code's built-in Bash write guard,
+    so ``--disallowedTools Edit,Write,NotebookEdit`` stopped the Edit/Write
+    TOOLS while ``echo x > file`` wrote the file anyway. A probe against a real
+    ``claude -p`` wrote the file on the shipped flags and did not once the
+    settings layer was dropped.
+    """
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="ok"))
+    adapters.ask_claude("read something")
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+
+    # ...and on the optioned read path too, not only the plain one.
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"result"}'))
+    adapters.ask_claude("read something", effort="high")
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+
+
+def test_write_mode_keeps_host_settings_but_still_loads_no_mcp(
+    monkeypatch, tmp_path, allow_write
+):
+    """The deliberate asymmetry.
+
+    Write mode must NOT drop the settings layer: hooks and deny rules live
+    there, and on this host they are what keeps a spawned Claude out of the
+    Hermes skill tree. Stripping them from the one mode allowed to write would
+    trade a small exposure for a larger one. MCP is still disabled, because
+    the child would otherwise load hardline itself, inherit this process's
+    environment, and be able to recurse into another write-enabled call.
+    """
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"result"}'))
+    adapters.ask_claude("fix it", workdir=str(tmp_path), write=True)
+    argv = calls[0]["cmd"]
+
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    assert "--strict-mcp-config" in argv
+    assert "--setting-sources" not in argv
+
+
+def test_run_timing_survives_the_jsonl_parse(monkeypatch):
+    """The parsers build a fresh result dict from the stream, so run-level
+    facts were dropped: a plain call reported elapsed_s/timeout_s while the
+    same call with a model or effort set reported neither - unanswerable on
+    exactly the calls slow enough for anyone to ask."""
+    _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"result"}'))
+    optioned = adapters.ask_claude("go", effort="high")
+    assert isinstance(optioned["elapsed_s"], float)
+    assert optioned["timeout_s"] == adapters._STREAMING_TIMEOUT_S
+
+    _capture_run(monkeypatch, _FakeCompleted(stdout="ok"))
+    plain = adapters.ask_claude("go")
+    assert isinstance(plain["elapsed_s"], float)
+    assert plain["timeout_s"] == adapters._CLAUDE_TIMEOUT_S
+
+    _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    codex = adapters.ask_codex("go", effort="high")
+    assert isinstance(codex["elapsed_s"], float)
+    assert codex["timeout_s"] == adapters._CODEX_TIMEOUT_S
+
+
+def test_structured_runs_are_watched_and_the_plain_one_is_not(monkeypatch):
+    """Both structured paths stream progress, so they are judged by silence;
+    the plain `claude -p` prints only at the end and keeps its wall clock."""
+    seen = []
+    real = adapters._run_agent_cmd
+
+    def spy(agent, argv, **kw):
+        seen.append((agent, kw.get("streaming", False)))
+        return real(agent, argv, **kw)
+
+    monkeypatch.setattr(adapters, "_run_agent_cmd", spy)
+    _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"result"}'))
+    adapters.ask_claude("go", effort="high")
+    _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("go", effort="high")
+    _capture_run(monkeypatch, _FakeCompleted(stdout="ok"))
+    adapters.ask_claude("go")
+    assert seen == [("claude", True), ("codex", True), ("claude", False)]
+
+
+def test_a_parsers_own_timing_is_not_clobbered(monkeypatch):
+    """If a parser ever reports timing from the stream itself, that is the
+    more precise number and must win over the process-level one."""
+    _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"result"}'))
+    monkeypatch.setattr(
+        adapters, "_parse_claude_stream", lambda *a, **k: {"ok": True, "elapsed_s": 1.5}
+    )
+    out = adapters.ask_claude("go", effort="high")
+    assert out["elapsed_s"] == 1.5  # not overwritten by the run's own value
+    assert out["timeout_s"] == adapters._STREAMING_TIMEOUT_S  # ...but this filled in
+
+
+def test_spawned_agents_never_inherit_the_write_opt_in(
+    monkeypatch, tmp_path, allow_write
+):
+    """The actual recursion boundary.
+
+    --strict-mcp-config stops the child DISCOVERING hardline through the host's
+    MCP config; it does not stop it reaching hardline another way (launching
+    `claude --mcp-config`, running the hardline executable, starting another
+    agent CLI). With HARDLINE_ALLOW_WRITE inherited, every one of those routes
+    comes back write-enabled and one authorized call multiplies into unbounded
+    unattended ones.
+    """
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"result"}'))
+    adapters.ask_claude("fix it", workdir=str(tmp_path), write=True)
+    child_env = calls[0]["kwargs"]["env"]
+
+    assert "HARDLINE_ALLOW_WRITE" not in child_env
+    # ...while the rest of the environment is still inherited, so the child can
+    # still find its own CLI, auth, and PATH.
+    assert "PATH" in child_env or "Path" in child_env
+
+
+def test_codex_children_also_lose_the_write_opt_in(monkeypatch, tmp_path, allow_write):
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout='{"type":"item.completed"}'))
+    adapters.ask_codex("fix it", workdir=str(tmp_path), write=True)
+    assert "HARDLINE_ALLOW_WRITE" not in calls[0]["kwargs"]["env"]
+
+
+def test_read_only_children_lose_it_too(monkeypatch, allow_write):
+    """Read mode never needed it, and leaving it set would hand a read-mode
+    child the same multiplier."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="ok"))
+    adapters.ask_claude("read something")
+    assert "HARDLINE_ALLOW_WRITE" not in calls[0]["kwargs"]["env"]
+
+
+def test_ask_claude_write_disabled_by_default(monkeypatch, tmp_path):
+    # Same gate as Codex's write path - a hardline registration that never
+    # sets HARDLINE_ALLOW_WRITE (e.g. Hermes's) cannot reach bypassPermissions
+    # regardless of what a caller (or a message that reached it) asks for.
+    monkeypatch.delenv("HARDLINE_ALLOW_WRITE", raising=False)
+    calls = _capture_run(monkeypatch)
+
+    out = adapters.ask_claude("edit it", workdir=str(tmp_path), write=True)
+
+    assert out["ok"] is False
+    assert "HARDLINE_ALLOW_WRITE" in out["error"]
+    assert calls == []
+
+
+def test_ask_claude_write_requires_workdir(allow_write):
+    out = adapters.ask_claude("edit it", write=True)
+    assert out["ok"] is False
+    assert "workdir" in out["error"].lower()
+
+
+def test_ask_claude_write_rejects_advisory_mode(allow_write, tmp_path):
+    out = adapters.ask_claude("edit it", write=True, mode="advisory")
+    assert out["ok"] is False
+    assert "advisory" in out["error"].lower()
+
+
+def test_ask_claude_write_grants_full_tools_and_bypasses_permissions(
+    allow_write, monkeypatch, tmp_path
+):
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5"},
+        {"type": "result", "subtype": "success", "result": "edited"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("edit it", workdir=str(tmp_path), write=True)
+
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    assert "--disallowedTools" not in argv
+    assert (
+        "-C" not in argv
+    )  # claude has no -C flag; cwd is set via the subprocess kwarg
+    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+
+
+def test_ask_claude_uses_explicit_workdir(monkeypatch, tmp_path):
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5"},
+        {"type": "result", "subtype": "success", "result": "ok"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("inspect", model="fable", workdir=str(tmp_path))
+
+    assert out["ok"] is True
+    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+
+
+def test_ask_claude_advisory_rejects_workdir(monkeypatch, tmp_path):
+    out = adapters.ask_claude("review", mode="advisory", workdir=str(tmp_path))
+    assert out["ok"] is False
+    assert "workdir" in out["error"].lower()
+
+
+def test_ask_claude_maps_advisory_tempdir_failure(monkeypatch):
+    calls = _capture_run(monkeypatch)
+
+    def fail_mkdtemp(*, prefix):
+        raise OSError("no writable temp directory")
+
+    monkeypatch.setattr(adapters.tempfile, "mkdtemp", fail_mkdtemp)
+
+    out = adapters.ask_claude("hello", model="fable", mode="advisory")
+
+    assert out["ok"] is False
+    assert "temporary directory" in out["error"].lower()
+    assert "no writable temp directory" in out["error"]
+    assert calls == []
+
+
+def test_ask_claude_rejects_flag_shaped_model(monkeypatch):
+    calls = _capture_run(monkeypatch)
+    out = adapters.ask_claude("hello", model="--dangerously-skip-permissions")
+    assert out["ok"] is False
+    assert "model" in out["error"].lower()
+    assert calls == []
+
+
+def test_ask_claude_separates_flag_shaped_prompt(monkeypatch):
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5"},
+        {"type": "result", "subtype": "success", "result": "ok"},
+    )
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("--model opus", model="fable")
+
+    assert out["ok"] is True
+    assert calls[0]["cmd"][-2:] == ["--", "--model opus"]
+
+
+def test_ask_claude_rejects_malformed_stream(monkeypatch):
+    _capture_run(monkeypatch, _FakeCompleted(stdout="not-json\n"))
+    out = adapters.ask_claude("hello", model="fable")
+    assert out["ok"] is False
+    assert "stream-json" in out["error"]
+
+
+# --------------------------------------------------------------------------
+# JSONL line splitting. str.splitlines() splits on characters JSONL does not
+# treat as delimiters and JSON does not require escaping, so one of them
+# inside any string value cut a valid line in half and discarded the entire
+# result. This destroyed a completed, already-paid-for agent review.
+# --------------------------------------------------------------------------
+
+# Only separators that can actually reach us RAW. JSON mandates escaping for
+# U+0000-001F, so every conforming encoder escapes \v \f \x1c \x1d \x1e -
+# including them would add cases that pass whether or not this is fixed.
+# These three sit ABOVE that range: JSON does not require escaping them, and
+# encoders emitting UTF-8 directly (Codex, Claude) leave them raw, while
+# str.splitlines() treats all three as line breaks. Verified against the
+# unfixed parser: each fails with "Unterminated string"; each parses now.
+_RAW_SEPARATORS = ["\u2028", "\u2029", "\x85"]
+
+
+def _raw_jsonl(*events):
+    """Encode events the way Codex/Claude do: UTF-8, not \\u-escaped."""
+    return "\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n"
+
+
+@pytest.mark.parametrize("sep", _RAW_SEPARATORS)
+def test_codex_jsonl_survives_raw_separator_in_a_string(monkeypatch, sep):
+    text = f"before{sep}after"
+    stdout = _raw_jsonl(
+        {"type": "thread.started", "thread_id": "t-1"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+        {"type": "turn.completed", "usage": {}},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is True, out.get("error")
+    assert out["reply"] == text  # separator preserved, not truncated at it
+    assert "malformed_lines" not in out
+
+
+@pytest.mark.parametrize("sep", _RAW_SEPARATORS)
+def test_claude_stream_survives_raw_separator_in_a_string(monkeypatch, sep):
+    text = f"before{sep}after"
+    stdout = _raw_jsonl(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5"},
+        {"type": "result", "subtype": "success", "result": text},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_claude("review", model="fable")
+
+    assert out["ok"] is True, out.get("error")
+    assert out["reply"] == text
+
+
+def test_one_damaged_line_does_not_discard_the_whole_result(monkeypatch):
+    """Previously any unparseable line aborted the parse and threw away every
+    other event - including the completed answer."""
+    stdout = (
+        json.dumps({"type": "thread.started", "thread_id": "t-2"})
+        + "\n{ this line is truncated and unparseable\n"
+        + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "answer"},
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "turn.completed", "usage": {}})
+        + "\n"
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    # Content is preserved - but NOT certified. Skipping a damaged line cannot
+    # tell which event was lost, so a surviving "answer" may be a stale
+    # earlier one; presenting that as ok=True would be worse than the total
+    # failure this replaced, because it is undetectable downstream.
+    assert out["ok"] is False
+    assert out["partial_reply"] == "answer"
+    assert "reply" not in out
+    assert out["malformed_lines"] == 1
+
+
+def test_damaged_terminal_event_is_not_reported_as_success(monkeypatch):
+    """The stale-success case specifically: the damage destroys the LAST
+    answer, so the survivor is an earlier, superseded one. The previous test
+    only damaged a line that carried nothing, so it could not catch this."""
+    stdout = (
+        json.dumps({"type": "thread.started", "thread_id": "t-3"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "EARLY draft answer"},
+            }
+        )
+        + "\n{ the FINAL answer's line was truncated here\n"
+        + json.dumps({"type": "turn.completed", "usage": {}})
+        + "\n"
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is False, "a superseded answer must not be certified"
+    assert out["partial_reply"] == "EARLY draft answer"
+    assert out["malformed_lines"] == 1
+    assert "partial_reply" in out and "reply" not in out
+
+
+# Captured from live Codex 0.161.0 jobs (#47): a process the sandbox could not
+# start, and a missing executable, which the shell starts and reports.
+_NOT_STARTED = {
+    "aggregated_output": "Failed to create unified exec process: "
+    "helper_unknown_error: setup refresh had errors",
+    "exit_code": -1, "status": "failed"}
+_NOT_FOUND = {
+    "aggregated_output": "The term 'definitely-not-a-command-xyz' is not "
+    "recognized as a name of a cmdlet, function, script file, or executable",
+    "exit_code": 1, "status": "failed"}
+_RAN = {"aggregated_output": "[build-system]\r\n", "exit_code": 0,
+        "status": "completed"}
+
+
+def _codex_turn(*commands: dict, damaged: bool = False) -> str:
+    """A completed Codex turn that ran `commands`, then answered."""
+    lines = [json.dumps({"type": "thread.started", "thread_id": "t-47"})]
+    lines += [
+        json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "command": "pwsh.exe -Command ...",
+            **command}})
+        for command in commands
+    ]
+    if damaged:
+        lines.append("{ a truncated line")
+    lines.append(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "the answer"}}))
+    lines.append(json.dumps({"type": "turn.completed", "usage": {}}))
+    return "\n".join(lines) + "\n"
+
+
+def _ask_codex_after(monkeypatch, stdout: str) -> dict:
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+    return adapters.ask_codex("review", model="gpt-5.6-sol")
+
+
+def test_a_bare_call_detects_a_turn_whose_commands_never_started(monkeypatch):
+    """The commonest call - ask_codex(prompt) - read plain text, which hides
+    the refused commands; it returned ok=True for a review that read nothing."""
+    _capture_run(monkeypatch, _FakeCompleted(stdout=_codex_turn(_NOT_STARTED)))
+
+    out = adapters.ask_codex("review")
+
+    assert out["ok"] is False
+    assert out.get("commands_not_started") == 1
+
+
+def test_a_bare_call_reports_how_a_failed_turn_exited(monkeypatch):
+    """A structured failure used to come back without the exit code and
+    timing the process reported - on the commonest call, once it read JSONL."""
+    stdout = _codex_stream(
+        {"type": "thread.started", "thread_id": "t-9"},
+        {"type": "turn.failed", "error": {"message": "usage limit reached"}},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout, returncode=1))
+
+    out = adapters.ask_codex("review")
+
+    assert out["ok"] is False and "usage limit reached" in out["error"]
+    assert out.get("exit_code") == 1
+    assert "elapsed_s" in out and "timeout_s" in out
+
+
+def test_a_stray_line_on_stdout_is_not_certified(monkeypatch):
+    """Chosen behaviour, pinned: a line that is not JSON may have been a lost
+    event, so the answer comes back as partial_reply, not ok."""
+    _capture_run(monkeypatch, _FakeCompleted(stdout="a banner\n" + _codex_reply("answer")))
+
+    out = adapters.ask_codex("review")
+
+    assert out["ok"] is False and out["partial_reply"] == "answer"
+
+
+def test_a_turn_none_of_whose_commands_started_is_not_a_success(monkeypatch):
+    """#47: Codex 0.161.0's Windows sandbox could start no process, the turn
+    still completed, and a review that read nothing came back ok=True."""
+    out = _ask_codex_after(monkeypatch, _codex_turn(_NOT_STARTED, _NOT_STARTED))
+
+    assert out["ok"] is False
+    assert "none of its 2 command(s)" in out["error"]
+    assert "setup refresh had errors" in out["error"]
+    assert out["partial_reply"] == "the answer" and "reply" not in out
+    assert out.get("commands_not_started") == 2
+
+
+def test_a_command_that_ran_and_failed_is_ordinary(monkeypatch):
+    """A missing executable fails after its shell started. Demoting that
+    would fail every review that ever reached for an absent tool."""
+    out = _ask_codex_after(monkeypatch, _codex_turn(_NOT_FOUND))
+
+    assert out["ok"] is True
+    assert "commands_not_started" not in out
+
+
+def test_some_commands_not_starting_is_counted_not_demoted(monkeypatch):
+    """What did run informed the reply; a caller can still see the gap."""
+    out = _ask_codex_after(monkeypatch, _codex_turn(_NOT_STARTED, _RAN))
+
+    assert out["ok"] is True
+    assert out["reply"] == "the answer"
+    assert out.get("commands_not_started") == 1
+
+
+def test_a_command_quoting_the_message_after_it_ran_is_ordinary(monkeypatch):
+    """A session investigating #47 greps the sandbox log and prints the
+    message. Its command started; only `status` tells the two apart."""
+    out = _ask_codex_after(monkeypatch, _codex_turn(
+        {**_RAN, "aggregated_output": _NOT_STARTED["aggregated_output"]}))
+
+    assert out["ok"] is True
+    assert "commands_not_started" not in out
+
+
+def test_an_exit_code_alone_does_not_mean_not_started(monkeypatch):
+    """-1 is what one sample carried; the message is the contract."""
+    out = _ask_codex_after(monkeypatch, _codex_turn({**_NOT_FOUND, "exit_code": -1}))
+
+    assert out["ok"] is True
+
+
+def test_not_starting_survives_a_damaged_stream(monkeypatch):
+    """The damaged-stream demotion rewrites `error`; the count stays."""
+    out = _ask_codex_after(monkeypatch, _codex_turn(_NOT_STARTED, damaged=True))
+
+    assert out["ok"] is False
+    assert out["malformed_lines"] == 1
+    assert out.get("commands_not_started") == 1
+
+
+def test_unparseable_output_returns_evidence_not_just_an_error(monkeypatch):
+    """The raw output used to be dropped, making a parse failure
+    unrecoverable. Keep a bounded excerpt so it stays diagnosable."""
+    _capture_run(monkeypatch, _FakeCompleted(stdout="totally not json at all\n"))
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is False
+    assert out["malformed_lines"] == 1
+    assert "totally not json" in out["raw_excerpt"]
+    assert out["raw_length"] > 0
+
+
+def test_raw_excerpt_keeps_both_ends_and_stays_bounded(monkeypatch):
+    """Head-only was near-useless for salvage: a JSONL stream's terminal event
+    and final answer are at the END, so the first 2KB of a 600KB review is
+    startup chatter. Keep both ends, and stay bounded so the payload cannot
+    blow up the caller's context - the failure this area keeps producing."""
+    stdout = "HEAD-MARKER" + ("x" * 500_000) + "TAIL-MARKER"
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout))
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is False
+    assert "HEAD-MARKER" in out["raw_excerpt"]
+    assert "TAIL-MARKER" in out["raw_excerpt"], "the end is where the answer lives"
+    assert "omitted" in out["raw_excerpt"], "must say what was dropped"
+    budget = adapters._EVIDENCE_HEAD + adapters._EVIDENCE_TAIL + 100
+    assert len(out["raw_excerpt"]) <= budget
+    assert out["raw_length"] == len(stdout)
+
+
+def test_nonzero_exit_still_surfaces_the_agents_output(monkeypatch):
+    """A nonzero exit with unparseable stdout computed the evidence and then
+    discarded it unless a thread_id happened to be present, so the caller saw
+    only "exit 1: ..." and the agent's output was gone - the unrecoverable
+    shape this evidence exists to prevent."""
+    _capture_run(
+        monkeypatch,
+        _FakeCompleted(
+            stdout="some unparseable but valuable output", stderr="boom", returncode=1
+        ),
+    )
+
+    out = adapters.ask_codex("review", model="gpt-5.6-sol")
+
+    assert out["ok"] is False
+    assert "valuable output" in out["raw_excerpt"]
+    assert out["raw_length"] > 0
+
+
+_CLAUDE_REFUSED = (
+    "Claude Code can't respond to this message with Fable 5.1. "
+    "Please change your model and try again."
+)
+
+
+def test_failed_claude_job_reports_the_error_its_stream_gave(monkeypatch):
+    """A nonzero exit used to surface only "exit 1: <11KB of stream-json>",
+    burying the result event's real reason. The parsed error must lead."""
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "fable-5.1"},
+        {
+            "type": "assistant",
+            "message": {"model": "fable-5.1", "content": []},
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": _CLAUDE_REFUSED,
+        },
+    )
+    _capture_run(
+        monkeypatch, _FakeCompleted(stdout=stdout, stderr="", returncode=1)
+    )
+
+    out = adapters.ask_claude("review", model="fable-5.1")
+
+    assert out["ok"] is False
+    assert out["error"] == _CLAUDE_REFUSED
+    assert out["exit_code"] == 1
+    assert isinstance(out["elapsed_s"], float)
+    assert out["actual_model"] == "fable-5.1"
+
+
+def test_nonzero_exit_with_a_clean_result_is_still_a_failure(monkeypatch):
+    """A result event that is not an error must not turn a nonzero exit into
+    ok: True. The reply Claude produced is kept, but as partial_reply."""
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "m"},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "done"},
+    )
+    _capture_run(
+        monkeypatch, _FakeCompleted(stdout=stdout, stderr="late crash", returncode=3)
+    )
+
+    out = adapters.ask_claude("review", effort="high")
+
+    assert out["ok"] is False
+    assert "reply" not in out
+    assert out["partial_reply"] == "done"
+    assert out["exit_code"] == 3
+    assert "exit 3" in out["error"]
+
+
+def test_failed_claude_job_without_a_result_keeps_raw_evidence(monkeypatch):
+    _capture_run(
+        monkeypatch,
+        _FakeCompleted(
+            stdout="some unparseable but valuable output", stderr="boom", returncode=1
+        ),
+    )
+
+    out = adapters.ask_claude("review", effort="high")
+
+    assert out["ok"] is False
+    assert out["error"].startswith("exit 1")
+    assert "valuable output" in out["raw_excerpt"]
+    assert out["raw_length"] > 0
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_a_silent_failed_exit_does_not_quote_its_stream_in_the_error(monkeypatch, agent):
+    """With nothing on stderr, the error used to be "exit 1: <all of stdout>",
+    an unbounded copy of what raw_excerpt already carries, bounded."""
+    _capture_run(
+        monkeypatch,
+        _FakeCompleted(stdout="x" * 50_000, stderr="", returncode=1),
+    )
+
+    out = getattr(adapters, f"ask_{agent}")("review", effort="high")
+
+    assert out["ok"] is False
+    assert out["error"] == "exit 1"
+    assert out["raw_length"] == 50_000 and len(out["raw_excerpt"]) < 50_000
+
+
+def test_a_parsed_failure_keeps_the_process_error_beside_it(monkeypatch):
+    """The stream's reason leads, but the exit and stderr are facts of the run
+    that nothing else carries."""
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "m"},
+        {"type": "result", "subtype": "success", "is_error": True, "result": _CLAUDE_REFUSED},
+    )
+    _capture_run(
+        monkeypatch, _FakeCompleted(stdout=stdout, stderr="only-on-stderr", returncode=1)
+    )
+
+    out = adapters.ask_claude("review", effort="high")
+
+    assert out["error"] == _CLAUDE_REFUSED
+    assert out.get("process_error") == "exit 1: only-on-stderr"
+    assert "reply" not in out, "an is_error result's reply is only its error again"
+
+
+def test_an_answer_already_failed_by_the_parser_is_partial_under_a_failed_run(
+    monkeypatch, tmp_path
+):
+    """Advisory mode fails a success it cannot attribute to the subscription
+    before the run's failure is looked at; its answer must still not read as
+    a reply."""
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "claude-fable-5", "apiKeySource": "x"},
+        {"type": "result", "subtype": "success", "result": "the answer"},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout, stderr="", returncode=1))
+    monkeypatch.setattr(adapters.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+
+    out = adapters.ask_claude("review", model="fable", mode="advisory")
+
+    assert out["ok"] is False and "subscription" in out["error"].lower()
+    assert "reply" not in out and out.get("partial_reply") == "the answer"
+    assert out.get("process_error") == "exit 1"
+
+
+def test_a_parsed_failure_keeps_the_stdin_shortfall(monkeypatch):
+    """Input the child never fully took is a process fact: a parsed error
+    from the stream must not hide it."""
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "model": "m"},
+        {"type": "result", "subtype": "success", "is_error": True, "result": _CLAUDE_REFUSED},
+    )
+    _capture_run(monkeypatch, _FakeCompleted(stdout=stdout, stderr="", returncode=1))
+    shortfall = "the child closed its stdin after accepting 0 of 9 bytes (no error)"
+    monkeypatch.setattr(adapters, "_stdin_shortfall", lambda *_: shortfall)
+
+    out = adapters.ask_claude("review", effort="high")
+
+    assert out["error"] == _CLAUDE_REFUSED
+    assert out.get("stdin_shortfall") == shortfall
+
+
+def test_ask_unknown_agent_rejected(monkeypatch):
+    calls = _capture_run(monkeypatch)
+    out = adapters.ask("nobody", "hi")
+    assert out["ok"] is False
+    assert "unknown" in out["error"].lower()
+    assert calls == []  # never spawned
+
+
+def test_ask_nonzero_exit_is_not_ok(monkeypatch):
+    _capture_run(monkeypatch, _FakeCompleted(stdout="", stderr="boom", returncode=1))
+    out = adapters.ask("hermes", "x")
+    assert out["ok"] is False
+    assert "boom" in out["error"]
+
+
+def test_ask_timeout_is_handled(monkeypatch):
+    _capture_run(monkeypatch, exc=subprocess.TimeoutExpired(cmd="hermes", timeout=120))
+    out = adapters.ask("hermes", "x")
+    assert out["ok"] is False
+    assert "timeout" in out["error"].lower()
+
+
+def test_timeout_preserves_the_partial_output_it_used_to_discard(monkeypatch):
+    """A bare "timeout after 900s" threw away work that had really been done.
+
+    TimeoutExpired carries whatever the child had already written; discarding
+    it destroyed a partially complete answer and left no way to tell a
+    healthy-but-slow agent from one wedged since the first second.
+    """
+    _capture_run(
+        monkeypatch,
+        exc=subprocess.TimeoutExpired(
+            cmd="claude",
+            timeout=900,
+            output="the first half of a real answer",
+            stderr="a warning",
+        ),
+    )
+    out = adapters.ask("hermes", "x")
+
+    assert out["ok"] is False
+    assert out["timed_out"] is True
+    assert out["timeout_s"] == adapters._TIMEOUT_S
+    assert out["timeout_layer"] == "subprocess"
+    assert out["produced_output"] is True
+    assert out["stdout_chars"] == len("the first half of a real answer")
+    assert "the first half of a real answer" in out["partial_stdout"]["raw_excerpt"]
+    assert "a warning" in out["partial_stderr"]["raw_excerpt"]
+    assert isinstance(out["elapsed_s"], float)
+
+
+class _Reapable:
+    """Minimal stand-in with real pipe objects, so _reap's two jobs — closing
+    the pipes and waiting — are both observable."""
+
+    def __init__(self, wait_raises=False):
+        self.pid = 4242
+        self._wait_raises = wait_raises
+
+        class _Pipe:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        self.stdout, self.stderr, self.stdin = _Pipe(), _Pipe(), _Pipe()
+
+    def wait(self, timeout=None):
+        if self._wait_raises:
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+        return 0
+
+
+def test_reap_reports_failure_rather_than_claiming_a_guarantee():
+    """_reap is BOUNDED, not guaranteed: if the kill silently failed or
+    teardown outlives the wait, the child is abandoned. Saying so is the
+    point - a claimed guarantee is how the leak would go unnoticed."""
+    stuck = _Reapable(wait_raises=True)
+    assert adapters._reap(stuck) is False
+    # Pipes are still closed even when the wait gives up - two leaked
+    # descriptors per occurrence in a long-lived server otherwise.
+    assert stuck.stdout.closed and stuck.stderr.closed and stuck.stdin.closed
+
+    clean = _Reapable()
+    assert adapters._reap(clean) is True
+    assert clean.stdout.closed
+
+
+def test_abort_warns_when_the_child_was_not_confirmed_dead(monkeypatch):
+    """_kill_tree suppresses every failure and _reap is bounded, so "we tried"
+    is not "it stopped". Reporting cancelled regardless would tell the
+    requester the work was stopped while it kept running with no pid recorded
+    anywhere - nothing could then find it to try again."""
+    _capture_run(monkeypatch)
+    monkeypatch.setattr(adapters, "_reap", lambda proc: False)
+
+    out = adapters._run_cmd(["x"], on_spawn=lambda pid: False)
+    assert out["cancelled"] is True
+    assert out["child_reaped"] is False
+    assert "may still be running" in out["warning"]
+
+
+def test_abort_is_clean_when_the_child_was_reaped(monkeypatch):
+    _capture_run(monkeypatch)
+    monkeypatch.setattr(adapters, "_reap", lambda proc: True)
+
+    out = adapters._run_cmd(["x"], on_spawn=lambda pid: False)
+    assert out["cancelled"] is True
+    assert out["child_reaped"] is True
+    assert "warning" not in out
+
+
+def test_a_command_line_at_the_windows_limit_is_measured_exactly(monkeypatch):
+    """32,767 UTF-16 units including the terminator: 32,766 characters spawn,
+    one more cannot."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert adapters._command_line_too_long(["a" * 32766]) is None
+    assert "32767 UTF-16 units" in (adapters._command_line_too_long(["a" * 32767]) or "")
+
+
+def test_the_windows_limit_counts_utf16_units_not_characters(monkeypatch):
+    """A prompt outside the BMP is two units a character: 16,384 of them is
+    far under the limit by len() and over it as Windows counts."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert adapters._command_line_too_long(["\U0001F600" * 16384])
+
+
+def test_the_windows_limit_is_measured_on_the_quoted_command_line(monkeypatch):
+    """Popen escapes each quote: 16,400 of them become 32,800 characters."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert adapters._command_line_too_long(['"' * 16400])
+
+
+def test_an_overlong_windows_command_line_spawns_nothing(monkeypatch):
+    """Refused with the cause and the remedy before any pipe or child, not as
+    WinError 206 "The filename or extension is too long"."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    spawned = []
+
+    def popen(*a, **k):
+        spawned.append("child")
+        raise OSError("spawned")
+
+    monkeypatch.setattr(adapters.subprocess, "Popen", popen)
+    monkeypatch.setattr(adapters.os, "pipe", lambda: spawned.append("pipe"))
+
+    out = adapters._run_cmd(["agent", "x" * 40000], stdin_text="evidence")
+    assert out["ok"] is False
+    assert "UTF-16 units" in out["error"] and "file in workdir" in out["error"]
+    assert spawned == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="CreateProcessW's limit is Windows-only")
+def test_the_windows_limit_is_where_createprocess_fails(monkeypatch):
+    """The constant is Windows' own: the longest line the guard admits spawns,
+    and one unit more fails in Popen itself once the guard is out of the way -
+    as FileNotFoundError (WinError 206 maps to ENOENT), which _run_cmd reported
+    as "command not found / not installed" for an executable that exists."""
+    def padded(units):
+        base = [sys.executable, "-c", "pass"]
+        fixed = len(subprocess.list2cmdline(base)) + 1  # the separating space
+        return base + ["a" * (units - fixed)]
+
+    longest = padded(adapters._WINDOWS_COMMAND_LINE_UNITS - 1)
+    assert adapters._run_cmd(longest, timeout_s=60)["ok"] is True
+
+    monkeypatch.setattr(adapters, "_command_line_too_long", lambda argv: None)
+    out = adapters._run_cmd(padded(adapters._WINDOWS_COMMAND_LINE_UNITS), timeout_s=60)
+    assert out["ok"] is False and "UTF-16" not in out["error"]
+
+
+def test_a_cmd_shim_is_held_to_cmd_exes_limit(monkeypatch):
+    """`shutil.which("codex")` finds an npm install's codex.CMD, which runs
+    through cmd.exe: 8,191 characters, not CreateProcess's 32,767."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert "cmd.exe" in (adapters._command_line_too_long(["C:/npm/codex.CMD", "a" * 8200]) or "")
+    assert adapters._command_line_too_long(["C:/bin/codex.exe", "a" * 8200]) is None
+
+
+@pytest.mark.parametrize("active", list('"%!&|<>^()\r\n'))
+def test_a_batch_shim_refuses_what_cmd_exe_would_act_on(monkeypatch, active):
+    """npm's codex.CMD runs through cmd.exe, which Popen does not quote for."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    error = adapters._batch_argument_refused(["C:/npm/codex.CMD", "exec", f"a{active}b"])
+    assert repr(active) in (error or "") and "HARDLINE_CODEX_CMD" in error
+
+
+@pytest.mark.parametrize("spelling", ["agent.cmd.", "agent.cmd ", "agent.CMD. ", "agent.bat.."])
+def test_a_batch_file_with_trailing_dots_or_spaces_is_still_one(monkeypatch, spelling):
+    """Windows drops them and runs the file through cmd.exe all the same."""
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert adapters._batch_argument_refused([f"C:/npm/{spelling}", "a & b"])
+
+
+def test_a_batch_shim_takes_plain_arguments(monkeypatch):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert adapters._batch_argument_refused(["C:/npm/codex.cmd", "exec", "--json", "plain words"]) is None
+
+
+def test_a_native_executable_takes_any_argument(monkeypatch):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    assert adapters._batch_argument_refused(["C:/bin/codex.exe", 'a "b" & %c%\nd']) is None
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", False)
+    assert adapters._batch_argument_refused(["/usr/bin/codex.cmd", "a & b"]) is None
+
+
+def test_a_refused_batch_argument_spawns_nothing(monkeypatch):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", True)
+    spawned = []
+
+    def popen(*a, **k):
+        spawned.append("child")
+        raise OSError("spawned")
+
+    monkeypatch.setattr(adapters.subprocess, "Popen", popen)
+    monkeypatch.setattr(adapters.os, "pipe", lambda: spawned.append("pipe"))
+    out = adapters._run_cmd(["C:/npm/codex.cmd", "exec", "--", "a & b"], stdin_text="evidence")
+    assert out["ok"] is False and "cmd.exe" in out["error"] and spawned == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="cmd.exe runs batch files on Windows only")
+def test_a_prompt_cannot_run_a_command_through_a_batch_shim(tmp_path, monkeypatch):
+    """A real shim forwarding %*, as npm's does. The control proves the probe
+    can see an injection: with the guard out of the way, the prompt's `&` runs
+    a second command, whose output is the sentinel."""
+    shim = tmp_path / "agent.cmd"
+    shim.write_text(f'@"{sys.executable}" -c "pass" %*\r\n', encoding="utf-8")
+    prompt = 'Quote: "a & echo INJECTED-7f3 & rem x'  # rem swallows the closing quote
+
+    out = adapters._run_cmd([str(shim), "exec", "--", prompt], timeout_s=60)
+    assert out["ok"] is False and "INJECTED-7f3" not in json.dumps(out)
+
+    monkeypatch.setattr(adapters, "_batch_argument_refused", lambda argv: None)
+    control = adapters._run_cmd([str(shim), "exec", "--", prompt], timeout_s=60)
+    assert "INJECTED-7f3" in json.dumps(control), "control: the probe never saw an injection"
+
+
+def test_a_spawn_too_long_for_windows_is_not_reported_missing(monkeypatch):
+    """WinError 206 arrives as FileNotFoundError; the executable exists."""
+    def popen(*a, **k):
+        error = FileNotFoundError(2, "The filename or extension is too long")
+        error.winerror = 206
+        raise error
+
+    monkeypatch.setattr(adapters.subprocess, "Popen", popen)
+    out = adapters._run_cmd(["agent"])
+    assert out["ok"] is False and out["error"].startswith("spawn failed")
+
+
+def test_the_command_line_limit_is_windows_only(monkeypatch):
+    monkeypatch.setattr(adapters, "_ON_WINDOWS", False)
+    assert adapters._command_line_too_long(["a" * 100000]) is None
+
+
+def test_timeout_with_no_output_is_distinguishable_from_a_slow_one(monkeypatch):
+    """The slow-vs-wedged signal: a child that emitted nothing in the whole
+    budget is a different failure from one cut off mid-answer."""
+    _capture_run(
+        monkeypatch, exc=subprocess.TimeoutExpired(cmd="claude", timeout=900)
+    )
+    out = adapters.ask("hermes", "x")
+    assert out["timed_out"] is True
+    assert out["produced_output"] is False
+    assert out["stdout_chars"] == 0
+    assert "partial_stdout" not in out
+
+
+def test_timeout_decodes_bytes_payloads(monkeypatch):
+    """TimeoutExpired's payload comes from a partially drained pipe and is
+    bytes on some paths even under text=True - reporting a timeout must not
+    itself crash."""
+    _capture_run(
+        monkeypatch,
+        exc=subprocess.TimeoutExpired(
+            cmd="claude", timeout=900, output=b"partial \xe2\x9c\x94 bytes"
+        ),
+    )
+    out = adapters.ask("hermes", "x")
+    assert out["produced_output"] is True
+    assert "partial" in out["partial_stdout"]["raw_excerpt"]
+
+
+def test_ask_missing_binary_is_handled(monkeypatch):
+    _capture_run(monkeypatch, exc=FileNotFoundError("hermes not found"))
+    out = adapters.ask("hermes", "x")
+    assert out["ok"] is False
+    assert (
+        "not found" in out["error"].lower() or "not installed" in out["error"].lower()
+    )
+
+
+def test_env_override_replaces_binary_but_keeps_subcommand(monkeypatch):
+    """HARDLINE_*_CMD overrides only the executable path; the fixed subcommand
+    (chat -q / exec / -p) must still be appended, and the prompt after it."""
+    monkeypatch.setenv("HARDLINE_HERMES_CMD", "C:/x/hermes.exe")
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="ok"))
+    adapters.ask("hermes", "status?")
+    assert calls[0]["cmd"] == ["C:/x/hermes.exe", "chat", "-Q", "-q", "status?"]
+
+
+def test_deliver_uses_same_agent_dispatch(monkeypatch):
+    """deliver(agent, notice) pushes a one-shot notification via the agent's
+    native mechanism — same dispatch table as ask()."""
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="delivered"))
+    out = adapters.deliver("hermes", "you have 1 new message; call inbox")
+    assert out["ok"] is True
+    argv = calls[0]["cmd"]
+    assert "you have 1 new message; call inbox" in argv
+
+
+# --------------------------------------------------------------------------
+# codex binary auto-discovery — the install dir is hash-named and rotates on
+# every Codex update, so a hardcoded path rots. Discovery picks the newest.
+# --------------------------------------------------------------------------
+
+
+def test_codex_discovery_picks_newest_install(monkeypatch, tmp_path):
+    import os
+
+    base = tmp_path / "OpenAI" / "Codex" / "bin"
+    old = base / "aaaa1111"
+    new = base / "bbbb2222"
+    for d in (old, new):
+        d.mkdir(parents=True)
+        (d / "codex.exe").write_text("x")
+    # make `new` newer than `old`
+    os.utime(old / "codex.exe", (1000, 1000))
+    os.utime(new / "codex.exe", (2000, 2000))
+
+    monkeypatch.setattr(adapters, "_codex_bin_root", lambda: base)
+    found = adapters._discover_codex()
+    assert found == str(new / "codex.exe")
+
+
+def test_codex_discovery_returns_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.setattr(adapters, "_codex_bin_root", lambda: tmp_path / "nope")
+    assert adapters._discover_codex() is None
+
+
+def test_codex_command_override_and_fallback_precedence(monkeypatch):
+    """Each rung, and the name of the rule that chose it (server_info reports it)."""
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: "C:/path/codex.exe")
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: "C:/legacy/codex.exe")
+
+    # The operator's explicit override remains authoritative; empty is unset.
+    monkeypatch.setenv("HARDLINE_CODEX_CMD", "C:/pinned/codex.exe")
+    assert adapters.agent_command("codex") == ("C:/pinned/codex.exe", "override")
+    monkeypatch.setenv("HARDLINE_CODEX_CMD", "")
+    assert adapters.agent_command("codex") == ("C:/path/codex.exe", "path")
+
+    # PATH is the preferred automatic resolution channel.
+    monkeypatch.delenv("HARDLINE_CODEX_CMD", raising=False)
+    assert adapters.agent_command("codex") == ("C:/path/codex.exe", "path")
+
+    # Legacy discovery and then the bare command remain fallbacks.
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: None)
+    assert adapters.agent_command("codex") == ("C:/legacy/codex.exe", "legacy_discovery")
+    monkeypatch.setattr(adapters, "_discover_codex", lambda: None)
+    assert adapters.agent_command("codex") == ("codex", "bare")
+
+
+def test_non_codex_agents_have_no_discovery(monkeypatch):
+    # hermes/claude resolve to bare default when no env override; no discovery.
+    monkeypatch.setattr(adapters.shutil, "which", lambda _: "C:/path/hermes.exe")
+    monkeypatch.delenv("HARDLINE_HERMES_CMD", raising=False)
+    assert adapters.agent_command("hermes") == ("hermes", "bare")
+    assert adapters._prefix_for("hermes")[0] == "hermes"
+
+
+# --------------------------------------------------------------------------
+# _run_cmd hardening: isolate stdin (this is a stdio MCP server — a spawned
+# child must NOT inherit the JSON-RPC pipe) and decode robustly (an agent
+# emitting non-ASCII must not crash the tool with UnicodeDecodeError).
+# --------------------------------------------------------------------------
+
+
+def test_run_cmd_isolates_stdin_and_decodes_utf8(monkeypatch):
+    monkeypatch.delenv("HARDLINE_HERMES_CMD", raising=False)
+    calls = _capture_run(monkeypatch, _FakeCompleted(stdout="ok"))
+    adapters.ask("hermes", "hi")
+    kw = calls[0]["kwargs"]
+    assert kw.get("stdin") == subprocess.DEVNULL
+    assert kw.get("encoding") == "utf-8"
+    assert kw.get("errors") == "replace"
+
+
+def test_known_agents_is_the_fixed_roster():
+    assert set(adapters.known_agents()) == {"claude", "hermes", "codex"}
+
+
+# --------------------------------------------------------------------------
+# Session lanes. Every Claude Code session spawns its own hardline process, so
+# the process IS the session and can derive its own identity - no caller
+# declares anything.
+# --------------------------------------------------------------------------
+
+
+def test_lane_is_empty_outside_a_session(monkeypatch):
+    """Hermes and Codex set none of these, so they keep their plain
+    identities and cross-agent messaging is untouched."""
+    assert adapters.lane_suffix() == ""
+    assert adapters.lane_for("hermes") == "hermes"
+
+
+def test_lane_combines_project_and_session_id(in_session):
+    # Readable enough to scan in `history`, unique enough that two sessions
+    # in the SAME repo don't collide - which project name alone can't do.
+    assert adapters.lane_suffix() == "fonts.1a2b3c4d"
+    assert adapters.lane_for("claude") == "claude:fonts.1a2b3c4d"
+
+
+def test_lane_depends_on_nothing_process_specific(monkeypatch, in_session):
+    """A /mcp reconnect respawns this process but keeps the session, so the
+    lane must not change - otherwise every in-flight result is orphaned.
+
+    The previous version of this test monkeypatched os.getpid and asserted the
+    lane was unchanged. lane_suffix() never calls getpid, so it passed
+    regardless and proved nothing. Assert the real property instead: the
+    derivation reads ONLY the session-scoped environment, so anything a
+    respawn changes (pid, cwd, process start time) cannot move it.
+    """
+    first = adapters.lane_suffix()
+    assert first  # fixture put us in a session
+
+    # Everything a respawn actually changes.
+    # NOT os.getpid - lane_suffix never calls it, so patching it was the dead
+    # assertion that made the previous version of this test vacuous. Perturb
+    # what the derivation actually touches instead.
+    monkeypatch.chdir(tempfile.mkdtemp())
+    monkeypatch.setenv("PWD", "/somewhere/else")
+
+    assert adapters.lane_suffix() == first
+
+    # And prove the test can fail: the lane MUST move when the session does.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "99999999-0000-0000-0000-000000000000")
+    assert adapters.lane_suffix() != first
+
+
+def test_explicit_label_overrides_derivation(monkeypatch, in_session):
+    monkeypatch.setenv("HARDLINE_AGENT_LABEL", "review-bot")
+    assert adapters.lane_for("claude") == "claude:review-bot"
+
+
+def test_lane_falls_back_to_cwd_when_project_dir_absent(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcdefgh-0000-0000-0000-000000000000")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    workdir = tmp_path / "someproject"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    assert adapters.lane_suffix() == "someproject.abcdefgh"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("claude", "claude"), ("claude:fonts.1a2b3c4d", "claude"), ("hermes", "hermes")],
+)
+def test_base_agent_strips_the_lane(name, expected):
+    assert adapters.base_agent(name) == expected

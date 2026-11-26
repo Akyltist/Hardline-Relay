@@ -1,0 +1,286 @@
+"""Headless end-to-end test over the REAL MCP protocol.
+
+The other tests exercise the mailbox and adapters directly (in-process). This
+one proves the piece they can't: two *independent* hardline-mcp server
+subprocesses — as two agents would each run — sharing one mailbox db, driven by
+real MCP clients over stdio. A cross-instance send -> inbox -> ack round-trip
+through JSON-RPC is the closest a test can get to "agent A messages agent B"
+without launching the agents themselves.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+import json
+import os
+import sys
+from pathlib import Path
+
+import anyio
+import pytest
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def _params(db_path) -> StdioServerParameters:
+    # A fresh server process pointed at an isolated shared db via HARDLINE_DB.
+    return StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "hardline_mcp.server"],
+        env={**os.environ, "HARDLINE_DB": str(db_path)},
+    )
+
+
+def _console_script() -> Path:
+    """The installed `hardline-mcp` console script, read from the
+    distribution's own record: a user install's scripts live outside
+    sysconfig's default scheme, so guessing the directory missed it."""
+    dist = importlib.metadata.distribution("hardline-mcp")
+    for file in dist.files or ():
+        if file.name in ("hardline-mcp", "hardline-mcp.exe"):
+            return Path(dist.locate_file(file)).resolve()
+    raise AssertionError("hardline-mcp is installed without its console script")
+
+
+def _tool_dict(result) -> dict:
+    """Extract the dict a tool returned from a CallToolResult."""
+    if result.structuredContent is not None:
+        return result.structuredContent
+    for block in result.content:
+        text = getattr(block, "text", None)
+        if text:
+            return json.loads(text)
+    raise AssertionError(f"no structured/text content in tool result: {result!r}")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("entry", ["module", "console"])
+async def test_headless_cross_instance_round_trip(tmp_path, entry):
+    db = tmp_path / "shared.db"
+    params = _params(db)
+    if entry == "console":
+        params.command = str(_console_script())
+        params.args = []
+
+    with anyio.fail_after(60):
+        # Instance A ("claude") — a full server subprocess — sends a message.
+        async with stdio_client(params) as (ra, wa):
+            async with ClientSession(ra, wa) as a:
+                await a.initialize()
+                names = {t.name for t in (await a.list_tools()).tools}
+                assert {"send", "inbox", "ack", "history"} <= names
+                ask_claude = next(
+                    t for t in (await a.list_tools()).tools if t.name == "ask_claude"
+                )
+                properties = ask_claude.inputSchema["properties"]
+                assert properties["model"]["anyOf"][0]["type"] == "string"
+                assert properties["effort"]["default"] == "default"
+                assert properties["effort"]["enum"] == [
+                    "default",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                ]
+                assert properties["mode"]["default"] == "default"
+                assert properties["mode"]["enum"] == ["default", "advisory"]
+                ask_codex = next(
+                    t for t in (await a.list_tools()).tools if t.name == "ask_codex"
+                )
+                codex_properties = ask_codex.inputSchema["properties"]
+                assert codex_properties["model"]["anyOf"][0]["type"] == "string"
+                assert codex_properties["effort"]["enum"] == [
+                    "default",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                ]
+                assert codex_properties["mode"]["enum"] == ["default", "advisory"]
+                assert codex_properties["workdir"]["anyOf"][0]["type"] == "string"
+                sent = _tool_dict(
+                    await a.call_tool(
+                        "send",
+                        {
+                            "from_agent": "claude",
+                            "to_agent": "hermes",
+                            "message": "headless hi",
+                        },
+                    )
+                )
+                assert sent["ok"] is True
+                message_id = sent["message_id"]
+
+        # Instance B ("hermes") — a SEPARATE server subprocess — reads the shared
+        # db over the protocol and sees A's message.
+        async with stdio_client(params) as (rb, wb):
+            async with ClientSession(rb, wb) as b:
+                await b.initialize()
+                # auto_ack=False so the EXPLICIT ack below still proves
+                # something; a consuming read would make it a no-op.
+                inbox = _tool_dict(
+                    await b.call_tool(
+                        "inbox", {"agent": "hermes", "auto_ack": False}
+                    )
+                )
+                assert inbox["count"] == 1
+                assert inbox["remaining"] == 1  # read, not consumed
+                assert inbox["messages"][0]["body"] == "headless hi"
+                assert inbox["messages"][0]["sender"] == "claude"
+
+                acked = _tool_dict(await b.call_tool("ack", {"message_id": message_id}))
+                assert acked["ok"] is True
+
+                after = _tool_dict(await b.call_tool("inbox", {"agent": "hermes"}))
+                assert after["count"] == 0  # acked -> no longer unread
+                assert after["remaining"] == 0
+
+
+@pytest.mark.anyio
+async def test_headless_unknown_agent_rejected_over_protocol(tmp_path):
+    # The server's recipient validation must surface over the wire, not just
+    # in the in-process unit test.
+    with anyio.fail_after(60):
+        async with stdio_client(_params(tmp_path / "mb.db")) as (r, w):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                res = _tool_dict(
+                    await s.call_tool(
+                        "send",
+                        {"from_agent": "claude", "to_agent": "nobody", "message": "x"},
+                    )
+                )
+                assert res["ok"] is False and "unknown" in res["error"].lower()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="portable fake executable uses a POSIX shebang"
+)
+@pytest.mark.anyio
+async def test_headless_claude_effort_reaches_actual_executable(tmp_path):
+    """MCP -> server -> adapter -> executable argv, without spending plan tokens."""
+    capture = tmp_path / "claude-argv.json"
+    fake = tmp_path / "claude"
+    fake.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+
+with open(os.environ["HARDLINE_CAPTURE_ARGV"], "w", encoding="utf-8") as fh:
+    json.dump(sys.argv[1:], fh)
+print(json.dumps({{"type": "system", "subtype": "init", "model": "claude-fable-5"}}))
+print(json.dumps({{"type": "result", "subtype": "success", "result": "captured"}}))
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "hardline_mcp.server"],
+        env={
+            **os.environ,
+            "HARDLINE_DB": str(tmp_path / "mb.db"),
+            "HARDLINE_CLAUDE_CMD": str(fake),
+            "HARDLINE_CAPTURE_ARGV": str(capture),
+        },
+    )
+
+    with anyio.fail_after(60):
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                payload = _tool_dict(
+                    await session.call_tool(
+                        "ask_claude",
+                        {
+                            "prompt": "capture this",
+                            "model": "fable",
+                            "effort": "xhigh",
+                        },
+                    )
+                )
+
+    assert payload["ok"] is True
+    argv = json.loads(capture.read_text(encoding="utf-8"))
+    assert argv[argv.index("--model") + 1] == "fable"
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+    assert argv[-2:] == ["--", "capture this"]
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="portable fake executable uses a POSIX shebang"
+)
+@pytest.mark.anyio
+async def test_headless_codex_effort_reaches_actual_executable(tmp_path):
+    """MCP -> server -> adapter -> Codex argv, without spending plan tokens."""
+    capture = tmp_path / "codex-argv.json"
+    fake = tmp_path / "codex"
+    fake.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+
+# The isolation probes every Codex call now makes first (#42).
+if sys.argv[1:3] == ["features", "list"]:
+    print("apps  stable  true")
+    print("plugins  stable  true")
+    sys.exit(0)
+if sys.argv[1:3] == ["mcp", "list"]:
+    print(json.dumps([{{"name": "hardline"}}]))
+    sys.exit(0)
+with open(os.environ["HARDLINE_CAPTURE_ARGV"], "w", encoding="utf-8") as fh:
+    json.dump(sys.argv[1:], fh)
+print(json.dumps({{"type": "thread.started", "thread_id": "fake-thread"}}))
+print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "captured"}}}}))
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 1}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "hardline_mcp.server"],
+        env={
+            **os.environ,
+            "HARDLINE_DB": str(tmp_path / "mb.db"),
+            "HARDLINE_CODEX_CMD": str(fake),
+            "HARDLINE_CAPTURE_ARGV": str(capture),
+        },
+    )
+
+    with anyio.fail_after(60):
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                payload = _tool_dict(
+                    await session.call_tool(
+                        "ask_codex",
+                        {
+                            "prompt": "capture this",
+                            "model": "gpt-5.6-terra",
+                            "effort": "ultra",
+                        },
+                    )
+                )
+
+    assert payload["ok"] is True
+    assert payload["usage"]["input_tokens"] == 1
+    argv = json.loads(capture.read_text(encoding="utf-8"))
+    assert argv[0] == "exec"
+    assert argv[argv.index("--model") + 1] == "gpt-5.6-terra"
+    assert argv[argv.index("-c") + 1] == 'model_reasoning_effort="ultra"'
+    assert "--json" in argv and "--ephemeral" in argv
+    # Through the real server process, not just the adapter (#42).
+    assert "features.apps=false" in argv and "features.plugins=false" in argv
+    assert 'mcp_servers={"hardline"={enabled=false}}' in argv
+    assert argv[-2:] == ["--", "capture this"]

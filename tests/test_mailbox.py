@@ -1,0 +1,711 @@
+"""Tests for hardline_mcp.mailbox — real temp-dir SQLite (concurrency is the point)."""
+
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from hardline_mcp import mailbox
+
+_T0 = datetime(2026, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _clock(start):
+    """A controllable now_fn: starts at `start`, advances via .tick(seconds)."""
+    state = {"now": start}
+
+    def now_fn():
+        return state["now"]
+
+    def tick(seconds):
+        state["now"] = state["now"] + timedelta(seconds=seconds)
+
+    now_fn.tick = tick
+    return now_fn
+
+
+def test_send_returns_id_and_timestamp(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    r = mailbox.send("claude", "hermes", "hello", db_path=db, now_fn=now_fn)
+    assert isinstance(r["message_id"], int)
+    assert r["created_at"] == "2026-07-16T12:00:00Z"
+
+
+def test_inbox_returns_unread_for_recipient_only(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    mailbox.send("claude", "hermes", "for hermes", db_path=db, now_fn=now_fn)
+    mailbox.send("claude", "codex", "for codex", db_path=db, now_fn=now_fn)
+
+    hermes_inbox, remaining = mailbox.inbox("hermes", db_path=db)
+    assert len(hermes_inbox) == 1
+    assert remaining == 0
+    assert hermes_inbox[0]["body"] == "for hermes"
+    assert hermes_inbox[0]["sender"] == "claude"
+    assert hermes_inbox[0]["recipient"] == "hermes"
+
+
+def test_ack_removes_from_unread_inbox(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    r = mailbox.send("hermes", "claude", "ping", db_path=db, now_fn=now_fn)
+    # auto_ack=False: this test is about the EXPLICIT ack below, and a
+    # consuming read here would ack the message first and make it pass for
+    # the wrong reason.
+    msgs, _ = mailbox.inbox("claude", auto_ack=False, db_path=db)
+    assert len(msgs) == 1
+
+    ack = mailbox.ack(r["message_id"], db_path=db, now_fn=now_fn)
+    assert ack["ok"] is True
+    assert mailbox.inbox("claude", db_path=db)[0] == []
+    # still visible when unread_only=False
+    seen, _ = mailbox.inbox("claude", unread_only=False, db_path=db)
+    assert len(seen) == 1
+
+
+def test_ack_unknown_id_returns_false(tmp_path):
+    db = tmp_path / "mb.db"
+    assert mailbox.ack(99999, db_path=db)["ok"] is False
+
+
+def _acker(monkeypatch, pid):
+    monkeypatch.setattr(mailbox, "current_identity", lambda: (pid, f"token-{pid}"))
+
+
+def test_a_consuming_read_records_who_acked_exactly_what_it_consumed(tmp_path, monkeypatch):
+    db = tmp_path / "mb.db"
+    mine = mailbox.send("codex", "claude:a", "mine", db_path=db)
+    theirs = mailbox.send("codex", "claude:b", "theirs", db_path=db)
+    browsed = mailbox.send("codex", "hermes", "browsed", db_path=db)
+    _acker(monkeypatch, 41)
+
+    mailbox.inbox("hermes", auto_ack=False, db_path=db)
+    mailbox.inbox(["claude:a", "claude:b"], owned="claude:a", conversation="c-1", db_path=db)
+
+    assert mailbox.peek(mine["message_id"], db_path=db)["acked_by"] == {
+        "pid": 41,
+        "process_key": "token-41",
+        "conversation": "c-1",
+    }
+    assert mailbox.peek(theirs["message_id"], db_path=db)["acked_by"] is None
+    assert mailbox.peek(browsed["message_id"], db_path=db)["acked_by"] is None
+
+
+def test_only_the_ack_that_took_effect_is_recorded(tmp_path, monkeypatch):
+    db = tmp_path / "mb.db"
+    sent = mailbox.send("codex", "claude:a", "x", db_path=db)
+    _acker(monkeypatch, 41)
+    assert mailbox.ack(sent["message_id"], owned="claude:b", db_path=db)["ok"] is False
+    assert mailbox.peek(sent["message_id"], db_path=db)["acked_by"] is None
+
+    assert mailbox.ack(sent["message_id"], owned="claude:a", conversation="first", db_path=db)["ok"]
+    _acker(monkeypatch, 42)
+    assert not mailbox.ack(sent["message_id"], owned="claude:a", conversation="second", db_path=db)["ok"]
+    assert mailbox.peek(sent["message_id"], db_path=db)["acked_by"]["conversation"] == "first"
+
+
+def test_an_ack_nothing_recorded_reads_unknown(tmp_path, monkeypatch):
+    """An older revision acks without recording, and may rebuild the store
+    without the table under a process that already initialized it."""
+    import sqlite3
+
+    db = tmp_path / "mb.db"
+    old = mailbox.send("codex", "hermes", "acked by older code", db_path=db)
+    raw = sqlite3.connect(str(db))
+    with raw:
+        raw.execute("DROP TABLE message_acks")
+        raw.execute("UPDATE messages SET acked_at = 'then' WHERE id = ?", (old["message_id"],))
+    raw.close()
+    got = mailbox.peek(old["message_id"], db_path=db)
+    assert (got["acked_at"], got["acked_by"]) == ("then", None)
+
+    read = mailbox.send("codex", "hermes", "read by current code", db_path=db)
+    _acker(monkeypatch, 43)
+    mailbox.inbox("hermes", db_path=db)
+    assert mailbox.peek(read["message_id"], db_path=db)["acked_by"]["pid"] == 43
+
+    raw = sqlite3.connect(str(db))
+    with raw:
+        raw.execute("DROP TABLE message_acks")
+    raw.close()
+    acked = mailbox.send("codex", "hermes", "acked by current code", db_path=db)
+    assert mailbox.ack(acked["message_id"], db_path=db)["ok"]
+    assert mailbox.peek(acked["message_id"], db_path=db)["acked_by"]["pid"] == 43
+
+
+def test_peek_reads_an_ack_and_its_acker_from_one_snapshot(tmp_path, monkeypatch):
+    """An ack committed between peek's look for the table and its read of the
+    message must not show up as an ack nobody recorded."""
+    import sqlite3
+
+    db = tmp_path / "mb.db"
+    sent = mailbox.send("codex", "hermes", "x", db_path=db)
+    raw = sqlite3.connect(str(db))
+    with raw:
+        raw.execute("DROP TABLE message_acks")
+
+    def ack_elsewhere():
+        with raw:
+            raw.execute(mailbox.MESSAGE_ACKS_TABLE)
+            raw.execute("UPDATE messages SET acked_at = 'now' WHERE id = ?", (sent["message_id"],))
+            raw.execute("INSERT INTO message_acks VALUES (?, 7, 'token-7', NULL)", (sent["message_id"],))
+
+    class Interleaved:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def execute(self, sql, *args):
+            cursor = self._conn.execute(sql, *args)
+            if "sqlite_master" in sql:
+                ack_elsewhere()
+            return cursor
+
+    connect = mailbox._connect
+    monkeypatch.setattr(mailbox, "_connect", lambda path: Interleaved(connect(path)))
+    got = mailbox.peek(sent["message_id"], db_path=db)
+    raw.close()
+    assert (got["acked_at"] is None) == (got["acked_by"] is None), got
+
+
+@pytest.mark.parametrize("consume", ["inbox", "ack"])
+def test_an_ack_and_its_record_commit_together(tmp_path, monkeypatch, consume):
+    import sqlite3
+
+    db = tmp_path / "mb.db"
+    sent = mailbox.send("codex", "hermes", "x", db_path=db)
+    record = mailbox._record_acks
+
+    def recorded_then_failed(*args):
+        record(*args)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(mailbox, "_record_acks", recorded_then_failed)
+    with pytest.raises(sqlite3.OperationalError):
+        if consume == "inbox":
+            mailbox.inbox("hermes", db_path=db)
+        else:
+            mailbox.ack(sent["message_id"], db_path=db)
+    got = mailbox.peek(sent["message_id"], db_path=db)
+    assert (got["acked_at"], got["acked_by"]) == (None, None)
+
+
+def test_ack_is_idempotent(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    r = mailbox.send("hermes", "claude", "ping", db_path=db, now_fn=now_fn)
+    assert mailbox.ack(r["message_id"], db_path=db, now_fn=now_fn)["ok"] is True
+    # second ack: already acked -> ok False (no row newly changed)
+    assert mailbox.ack(r["message_id"], db_path=db, now_fn=now_fn)["ok"] is False
+
+
+def test_history_all_agents_newest_first_with_limit(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    for i in range(5):
+        mailbox.send("claude", "hermes", f"m{i}", db_path=db, now_fn=now_fn)
+        now_fn.tick(1)
+    hist = mailbox.history(limit=3, db_path=db)
+    assert len(hist) == 3
+    assert [h["body"] for h in hist] == ["m4", "m3", "m2"]  # newest first
+
+
+def test_history_filtered_by_agent_matches_sender_or_recipient(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    mailbox.send("claude", "hermes", "a", db_path=db, now_fn=now_fn)
+    mailbox.send("codex", "claude", "b", db_path=db, now_fn=now_fn)
+    mailbox.send("hermes", "codex", "c", db_path=db, now_fn=now_fn)  # no claude
+
+    claude_hist = mailbox.history(agent="claude", db_path=db)
+    bodies = {h["body"] for h in claude_hist}
+    assert bodies == {"a", "b"}  # claude as sender OR recipient, not "c"
+
+
+def test_survives_reopen_same_db(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    mailbox.send("claude", "hermes", "persist", db_path=db, now_fn=now_fn)
+    # fresh calls reopen the connection — data must persist on disk
+    assert len(mailbox.inbox("hermes", db_path=db)[0]) == 1
+
+
+def test_unicode_body_round_trips(tmp_path):
+    # The adapter decodes agent output as UTF-8; the store must be just as
+    # unicode-safe. Non-ASCII bodies must survive send -> SQLite -> inbox.
+    db = tmp_path / "mb.db"
+    body = "café ☕ 日本語 — rocket 🚀  line-sep"
+    r = mailbox.send("claude", "hermes", body, db_path=db)
+    got, _ = mailbox.inbox("hermes", db_path=db)
+    assert got[0]["message_id"] == r["message_id"]
+    assert got[0]["body"] == body
+
+
+def test_inbox_limit_caps_batch_and_reports_remaining(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    for i in range(10):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db, now_fn=now_fn)
+        now_fn.tick(1)
+
+    msgs, remaining = mailbox.inbox("hermes", limit=4, auto_ack=False, db_path=db)
+    assert [m["body"] for m in msgs] == ["m0", "m1", "m2", "m3"]  # oldest first
+    # auto_ack=False consumed nothing, so all 10 are still unread
+    assert remaining == 10
+
+
+def test_after_id_pages_past_mail_left_unacked(tmp_path):
+    """A reader deferring a full batch would otherwise re-read it forever and
+    never reach what arrived after it."""
+    db = tmp_path / "mb.db"
+    for i in range(10):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db)
+    first, _ = mailbox.inbox("hermes", limit=4, auto_ack=False, db_path=db)
+    second, remaining = mailbox.inbox(
+        "hermes", limit=4, auto_ack=False, after_id=first[-1]["message_id"], db_path=db
+    )
+    assert [m["body"] for m in second] == ["m4", "m5", "m6", "m7"]
+    assert remaining == 10, "after_id narrows the read, not the count"
+    last, _ = mailbox.inbox(
+        "hermes", auto_ack=False, after_id=second[-1]["message_id"] + 1, db_path=db
+    )
+    assert [m["body"] for m in last] == ["m9"], "strictly after: m8 is skipped"
+
+
+def test_more_says_when_paging_past_deferred_mail_is_done(tmp_path):
+    """Deferred mail keeps ``remaining`` positive, so only ``more`` ends the
+    drain; without it the last read of every wake was an empty one."""
+    db = tmp_path / "mb.db"
+    for i in range(3):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db)
+    first, _, more = mailbox.read_batch("hermes", limit=2, auto_ack=False, db_path=db)
+    assert more is True
+    last, remaining, more = mailbox.read_batch(
+        "hermes", auto_ack=False, after_id=first[-1]["message_id"], db_path=db
+    )
+    assert ([m["body"] for m in last], remaining, more) == (["m2"], 3, False)
+    past, remaining, more = mailbox.read_batch(
+        "hermes", auto_ack=False, after_id=last[-1]["message_id"], db_path=db
+    )
+    assert (past, remaining, more) == ([], 3, False)
+
+
+def test_more_after_a_consuming_read(tmp_path):
+    db = tmp_path / "mb.db"
+    for i in range(2):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db)
+    assert mailbox.read_batch("hermes", limit=1, db_path=db)[1:] == (1, True)
+    assert mailbox.read_batch("hermes", limit=1, db_path=db)[1:] == (0, False)
+
+
+def test_more_counts_only_mail_this_reader_can_consume(tmp_path):
+    """Another session's lane is shown but never consumable: counting it would
+    keep a reader paging after its own mail is done. Its own lane counts."""
+    db = tmp_path / "mb.db"
+    lanes = ["claude", "claude:other", "claude:mine"]
+    mailbox.send("codex", "claude", "shared", db_path=db)
+    mailbox.send("codex", "claude:other", "not yours", db_path=db)
+    read = lambda: mailbox.read_batch(  # noqa: E731
+        lanes, limit=1, auto_ack=False, owned=("claude:mine",), db_path=db
+    )
+    got, _, more = read()
+    assert ([m["body"] for m in got], more) == (["shared"], False)
+    mailbox.send("codex", "claude:mine", "yours", db_path=db)
+    assert read()[2] is True
+
+
+def test_a_consuming_read_past_the_last_message_still_counts_what_is_unread(tmp_path):
+    """The look-before-reserving probe honoured after_id, so a consuming read
+    past every unread message answered ([], 0) and hid the mail before it."""
+    db = tmp_path / "mb.db"
+    sent = mailbox.send("codex", "hermes", "m0", db_path=db)["message_id"]
+    got, remaining = mailbox.inbox("hermes", after_id=sent, db_path=db)
+    assert (got, remaining) == ([], 1)
+
+
+def test_repeated_polls_advance_through_the_backlog(tmp_path):
+    """The regression that makes a bare ``limit`` worse than no limit.
+
+    Oldest-first + a limit + nothing acking pins the caller to the same first
+    batch forever, so it never sees a newer message. Consuming what was
+    returned is what turns the limit into a drain.
+    """
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    for i in range(12):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db, now_fn=now_fn)
+        now_fn.tick(1)
+
+    first, rem1 = mailbox.inbox("hermes", limit=5, db_path=db, now_fn=now_fn)
+    second, rem2 = mailbox.inbox("hermes", limit=5, db_path=db, now_fn=now_fn)
+    third, rem3 = mailbox.inbox("hermes", limit=5, db_path=db, now_fn=now_fn)
+
+    assert [m["body"] for m in first] == ["m0", "m1", "m2", "m3", "m4"]
+    assert [m["body"] for m in second] == ["m5", "m6", "m7", "m8", "m9"]
+    assert [m["body"] for m in third] == ["m10", "m11"]
+    assert (rem1, rem2, rem3) == (7, 2, 0)
+
+    # drained: a fourth poll is empty rather than replaying the backlog
+    assert mailbox.inbox("hermes", limit=5, db_path=db, now_fn=now_fn) == ([], 0)
+
+
+def test_auto_ack_consumes_exactly_what_it_returned(tmp_path):
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    for i in range(6):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db, now_fn=now_fn)
+        now_fn.tick(1)
+
+    returned, _ = mailbox.inbox("hermes", limit=2, db_path=db, now_fn=now_fn)
+    returned_ids = {m["message_id"] for m in returned}
+
+    everything, _ = mailbox.inbox(
+        "hermes", unread_only=False, limit=100, auto_ack=False, db_path=db
+    )
+    acked = {m["message_id"] for m in everything if m["acked_at"] is not None}
+    assert acked == returned_ids  # not one row more
+
+
+def test_auto_ack_does_not_touch_another_recipients_mail(tmp_path):
+    """Guards the lazy implementation: a global ``UPDATE ... WHERE acked_at
+    IS NULL`` with no recipient scope, which would let one agent's poll mark
+    every other agent's mail read.
+
+    Verified by mutation: this fails under a globally-scoped ack and passes
+    under a recipient-scoped one, so the tighter "only the returned ids"
+    guarantee is covered by test_auto_ack_consumes_exactly_what_it_returned,
+    not here.
+    """
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    mailbox.send("claude", "hermes", "for hermes", db_path=db, now_fn=now_fn)
+    mailbox.send("claude", "codex", "for codex", db_path=db, now_fn=now_fn)
+    mailbox.send("claude", "claude:other.9999zzzz", "for a lane", db_path=db, now_fn=now_fn)
+
+    mailbox.inbox("hermes", db_path=db, now_fn=now_fn)
+
+    codex_left, _ = mailbox.inbox("codex", auto_ack=False, db_path=db)
+    lane_left, _ = mailbox.inbox("claude:other.9999zzzz", auto_ack=False, db_path=db)
+    assert len(codex_left) == 1
+    assert len(lane_left) == 1
+
+
+def test_limit_is_clamped_so_the_bound_cannot_be_opted_out_of(tmp_path, flood):
+    db = tmp_path / "mb.db"
+    flood(db, [f"m{i}" for i in range(mailbox.MAX_INBOX_LIMIT + 25)], now_fn=_clock(_T0))
+
+    msgs, remaining = mailbox.inbox("hermes", limit=10_000, auto_ack=False, db_path=db)
+    assert len(msgs) == mailbox.MAX_INBOX_LIMIT
+    assert remaining == mailbox.MAX_INBOX_LIMIT + 25
+
+
+@pytest.mark.parametrize("bad", [0, -5, "nonsense", None])
+def test_nonsense_limit_falls_back_to_a_bounded_read(tmp_path, flood, bad):
+    db = tmp_path / "mb.db"
+    flood(db, [f"m{i}" for i in range(40)])
+    msgs, _ = mailbox.inbox("hermes", limit=bad, auto_ack=False, db_path=db)
+    assert 1 <= len(msgs) <= mailbox.MAX_INBOX_LIMIT
+
+
+def test_browsing_mode_does_not_consume_and_does_not_pin(tmp_path):
+    """``unread_only=False`` re-serves acked rows, which auto_ack cannot
+    consume - so pairing them would loop on the same oldest batch forever
+    while ``remaining`` stayed positive. Consuming is confined to unread
+    reads for exactly that reason."""
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    for i in range(6):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db, now_fn=now_fn)
+
+    # Browse rows that are still UNREAD - that is what makes this discriminating.
+    # Browsing an already-acked page would leave a consuming implementation
+    # nothing to consume, and the test would pass either way.
+    first, rem1 = mailbox.inbox("hermes", unread_only=False, limit=3, db_path=db)
+    second, rem2 = mailbox.inbox("hermes", unread_only=False, limit=3, db_path=db)
+    assert [m["body"] for m in first] == ["m0", "m1", "m2"]
+    assert [m["body"] for m in second] == ["m0", "m1", "m2"]
+    assert rem1 == rem2 == 6  # nothing consumed by either browse
+    assert all(m["acked_at"] is None for m in first)
+
+    # Every message is therefore still deliverable through a normal drain.
+    drained, rem3 = mailbox.inbox("hermes", limit=10, db_path=db, now_fn=now_fn)
+    assert [m["body"] for m in drained] == [f"m{i}" for i in range(6)]
+    assert rem3 == 0
+
+
+def test_consuming_read_stamps_acked_at_on_what_it_returned(tmp_path):
+    """A row this call just consumed must not come back claiming acked_at
+    is None - the caller may act on that field."""
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    mailbox.send("codex", "hermes", "m", db_path=db, now_fn=now_fn)
+    msgs, _ = mailbox.inbox("hermes", db_path=db, now_fn=now_fn)
+    assert msgs[0]["acked_at"] == "2026-07-16T12:00:00Z"
+
+
+def test_consuming_read_honours_the_lane_guard(tmp_path):
+    """The mailbox-level mirror of the server test: reading a lane you do not
+    hold shows the messages but must not consume them."""
+    db = tmp_path / "mb.db"
+    now_fn = _clock(_T0)
+    mailbox.send("codex", "claude:owner.aaaa1111", "theirs", db_path=db, now_fn=now_fn)
+    mailbox.send("codex", "claude", "shared", db_path=db, now_fn=now_fn)
+
+    # A process holding a DIFFERENT lane reads both.
+    msgs, _ = mailbox.inbox(
+        ["claude", "claude:owner.aaaa1111"],
+        owned="claude:intruder.bbbb2222",
+        db_path=db,
+        now_fn=now_fn,
+    )
+    assert {m["body"] for m in msgs} == {"theirs", "shared"}
+
+    left, _ = mailbox.inbox(
+        "claude:owner.aaaa1111", auto_ack=False, db_path=db
+    )
+    assert [m["body"] for m in left] == ["theirs"]  # NOT consumed
+    # The unqualified one stays shared and consumable by anyone, as documented.
+    shared_left, _ = mailbox.inbox("claude", auto_ack=False, db_path=db)
+    assert shared_left == []
+
+
+def test_a_laneless_process_cannot_consume_lane_qualified_mail(tmp_path):
+    db = tmp_path / "mb.db"
+    mailbox.send("codex", "claude:owner.aaaa1111", "theirs", db_path=db)
+    mailbox.inbox("claude:owner.aaaa1111", owned=None, db_path=db)
+    left, _ = mailbox.inbox("claude:owner.aaaa1111", auto_ack=False, db_path=db)
+    assert len(left) == 1
+
+
+def test_history_limit_is_clamped_and_negative_is_not_unlimited(tmp_path, flood):
+    """SQLite reads a negative LIMIT as 'no limit', so history(limit=-1) was
+    an unbounded read of whole bodies."""
+    db = tmp_path / "mb.db"
+    flood(db, [f"m{i}" for i in range(mailbox.MAX_HISTORY_LIMIT + 40)])
+
+    assert len(mailbox.history(limit=10_000, db_path=db)) == mailbox.MAX_HISTORY_LIMIT
+    assert len(mailbox.history(limit=-1, db_path=db)) == 1
+    assert len(mailbox.history(limit="junk", db_path=db)) == mailbox.DEFAULT_HISTORY_LIMIT
+
+
+def test_remaining_excludes_mail_this_caller_cannot_consume(tmp_path):
+    """``remaining`` drives the documented "poll while non-zero" loop, so
+    counting rows this caller can never ack would never let it terminate -
+    head-of-line blocking behind another session's mail."""
+    db = tmp_path / "mb.db"
+    mailbox.send("codex", "claude:owner.aaaa1111", "theirs", db_path=db)
+
+    msgs, remaining = mailbox.inbox(
+        "claude:owner.aaaa1111", owned="claude:intruder.bbbb2222", db_path=db
+    )
+    assert len(msgs) == 1  # visible, as history/visibility semantics allow
+    assert remaining == 0  # but not deliverable to me, so the loop ends
+
+    # The real owner still sees it as theirs to take.
+    _, owner_remaining = mailbox.inbox(
+        "claude:owner.aaaa1111",
+        owned="claude:owner.aaaa1111",
+        auto_ack=False,
+        db_path=db,
+    )
+    assert owner_remaining == 1
+
+
+def test_non_consuming_reads_do_not_take_the_writer_lock(tmp_path):
+    """WAL exists so readers and writers coexist. Reserving the single writer
+    for a call that will never write serializes browsing and foreign-lane
+    reads against every real writer."""
+    db = tmp_path / "mb.db"
+    mailbox.send("codex", "hermes", "m", db_path=db)
+
+    import sqlite3
+
+    # Hold the writer lock, then prove a non-consuming read still completes.
+    blocker = sqlite3.connect(str(db), timeout=0.2, isolation_level=None)
+    blocker.execute("PRAGMA busy_timeout=200")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        msgs, _ = mailbox.inbox("hermes", auto_ack=False, db_path=db)
+        assert len(msgs) == 1
+        browse, _ = mailbox.inbox("hermes", unread_only=False, db_path=db)
+        assert len(browse) == 1
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+
+def test_history_pages_backward_to_reach_a_consumed_message(tmp_path, flood):
+    """``inbox`` consumes what it returns, so history is the recovery route -
+    but newest-first plus a cap left anything older than one page
+    unreachable, and you do not know the id to ``peek`` when the response
+    itself was lost. Paging is what makes recovery possible."""
+    db = tmp_path / "mb.db"
+    total = mailbox.MAX_HISTORY_LIMIT + 60
+    flood(db, [f"m{i}" for i in range(total)])
+
+    # Consume everything, as the default read now does.
+    while mailbox.inbox("hermes", limit=mailbox.MAX_INBOX_LIMIT, db_path=db)[1]:
+        pass
+
+    page1 = mailbox.history(limit=mailbox.MAX_HISTORY_LIMIT, agent="hermes", db_path=db)
+    assert len(page1) == mailbox.MAX_HISTORY_LIMIT
+    oldest_seen = page1[-1]["message_id"]
+
+    # m0 is older than one capped page: unreachable without paging.
+    assert "m0" not in {m["body"] for m in page1}
+
+    page2 = mailbox.history(
+        limit=mailbox.MAX_HISTORY_LIMIT,
+        agent="hermes",
+        before_id=oldest_seen,
+        db_path=db,
+    )
+    assert len(page2) == 60
+    assert "m0" in {m["body"] for m in page2}  # recovered
+    # Pages do not overlap, so a caller walking back sees each message once.
+    assert not ({m["message_id"] for m in page1} & {m["message_id"] for m in page2})
+
+
+def test_history_before_id_composes_with_the_agent_filter(tmp_path):
+    """The agent predicate is an OR-chain; unparenthesized, `AND id < ?`
+    would bind to only its last term and leak other agents' messages."""
+    db = tmp_path / "mb.db"
+    hermes_ids = []
+    for i in range(6):
+        hermes_ids.append(
+            mailbox.send("codex", "hermes", f"h{i}", db_path=db)["message_id"]
+        )
+        mailbox.send("codex", "claude", f"c{i}", db_path=db)
+
+    # The cutoff must actually EXCLUDE matching rows, otherwise the precedence
+    # bug has no visible effect and this test cannot fail.
+    rows = mailbox.history(
+        limit=100, agent="hermes", before_id=hermes_ids[3], db_path=db
+    )
+    # Unparenthesized, `recipient = 'hermes'` alone would satisfy the WHERE and
+    # drag h3-h5 back in despite the cutoff.
+    assert {m["body"] for m in rows} == {"h0", "h1", "h2"}
+    assert all(m["recipient"] == "hermes" for m in rows)
+
+
+def test_concurrent_pollers_never_receive_the_same_message(tmp_path):
+    """The claim a bare `with conn:` could not make.
+
+    Python's legacy transaction mode opens a transaction only on DML, so the
+    SELECT ran outside it: two pollers read the same ids, one UPDATE won and
+    the other matched zero rows, yet BOTH returned the batch.
+
+    The interleaving is ORCHESTRATED, not raced. A barrier on loop entry
+    would only make overlap likely - on a slow or single-core runner each
+    thread can finish its whole select/update pair before the other starts,
+    and the broken implementation would pass. Here poller A is suspended in
+    the exact select-done/update-pending window and B is released into it, so
+    the defect is reproduced deterministically rather than probabilistically.
+    """
+    import threading
+
+    db = tmp_path / "mb.db"
+    for i in range(6):
+        mailbox.send("codex", "hermes", f"m{i}", db_path=db)
+
+    real_connect = mailbox._connect
+    b_result: dict = {}
+    b_thread_holder: dict = {}
+
+    class _PauseBeforeUpdate:
+        """Proxy that releases the second poller just before A's UPDATE."""
+
+        def __init__(self, real):
+            self._real = real
+            self._fired = False
+
+        def execute(self, sql, params=()):
+            if not self._fired and sql.lstrip().upper().startswith("UPDATE"):
+                self._fired = True
+
+                def run_b():
+                    b_result["msgs"] = mailbox.inbox("hermes", limit=3, db_path=db)[0]
+
+                t = threading.Thread(target=run_b)
+                t.start()
+                b_thread_holder["t"] = t
+                # Give B time to reach its own claim. Correct code makes it
+                # block on BEGIN IMMEDIATE; broken code lets it SELECT the
+                # very rows A is about to consume.
+                time.sleep(0.4)
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    hooked = {"n": 0}
+
+    def connect_once(path):
+        conn = real_connect(path)
+        hooked["n"] += 1
+        return _PauseBeforeUpdate(conn) if hooked["n"] == 1 else conn
+
+    mailbox._connect = connect_once
+    try:
+        a_msgs, _ = mailbox.inbox("hermes", limit=3, db_path=db)
+    finally:
+        mailbox._connect = real_connect
+
+    t = b_thread_holder.get("t")
+    assert t is not None, "the pause hook never fired - test did not exercise the window"
+    t.join(timeout=30)
+    assert not t.is_alive(), "second poller deadlocked"
+
+    a_ids = {m["message_id"] for m in a_msgs}
+    b_ids = {m["message_id"] for m in b_result["msgs"]}
+    assert a_ids, "first poller got nothing"
+    assert b_ids, "second poller got nothing"
+    assert not (a_ids & b_ids), (
+        f"same message delivered to both pollers: {sorted(a_ids & b_ids)}"
+    )
+
+
+def test_concurrent_writers_do_not_lose_or_duplicate(tmp_path):
+    # The headline durability claim: WAL mode + per-call connections let many
+    # agent subprocesses write the same mailbox at once without losing or
+    # corrupting messages. Hammer one db from several threads and prove every
+    # message landed exactly once (unique ids, exact count, no exceptions).
+    import threading
+
+    db = tmp_path / "mb.db"
+    n_threads, per_thread = 8, 30
+    errors: list[Exception] = []
+    barrier = threading.Barrier(n_threads)  # maximize write overlap
+
+    def worker(tid: int) -> None:
+        try:
+            barrier.wait()
+            for i in range(per_thread):
+                mailbox.send(f"agent{tid}", "hermes", f"t{tid}-m{i}", db_path=db)
+        except Exception as e:  # noqa: BLE001 - surface any concurrency failure
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"concurrent writers raised: {errors}"
+    # Read the store directly rather than through history(): this asserts
+    # DURABILITY, and history is deliberately capped at MAX_HISTORY_LIMIT to
+    # keep an audit read out of an agent's context. Going through the capped
+    # API here would test the cap, not whether any write was lost.
+    import sqlite3
+
+    with sqlite3.connect(str(db)) as raw:
+        rows = raw.execute("SELECT id, body FROM messages").fetchall()
+
+    assert len(rows) == n_threads * per_thread  # nothing lost
+    ids = [r[0] for r in rows]
+    assert len(set(ids)) == len(ids)  # nothing duplicated
+    bodies = {r[1] for r in rows}
+    assert len(bodies) == n_threads * per_thread  # every distinct message present

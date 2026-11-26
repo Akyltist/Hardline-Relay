@@ -1,0 +1,11 @@
+{
+  "name": "hardline-dsh-notice-experiment",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./index.mjs",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.5"
+  }
+}

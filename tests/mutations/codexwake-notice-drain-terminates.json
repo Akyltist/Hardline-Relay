@@ -1,0 +1,8 @@
+{
+  "file": "hardline_mcp/codex_queue.py",
+  "before": "\"while more is true, read on with after_id=last_message_id. \"",
+  "after": "\"read again until remaining is 0. \"",
+  "tests": [
+    "tests/test_codex_queue.py::test_the_notice_is_exactly_this_text"
+  ]
+}

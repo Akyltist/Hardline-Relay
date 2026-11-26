@@ -1,0 +1,89 @@
+# TODO
+
+The short list. Collaborative detail lives in
+[GitHub issues](https://github.com/sushiHex/hardline-mcp/issues); everything
+below is known and deliberate.
+
+## Open design question
+
+**Stable instance addresses.** Ownership rests on reclaimable names, with
+absence made insufficient rather than replaced: a claim needs evidence. A
+2026-10-13 design pass deferred a separate instance address against stated
+criteria and recorded when to revisit; see "Stable instance addresses" under
+[Decisions](docs/architecture.md#decisions-and-what-was-rejected).
+
+**Reviewed 2026-10-27: deferred again, on an event, not a date** (see the
+same section of `docs/architecture.md`). Reopen when a report shows an unread
+job notice on an unheld parent-derived `codex:` lane whose job owner died in a
+relaunch, or one thread loaded in two live servers at once. Until then, read
+each `hardline-mcp report` against the triggers below. First-call
+registration of parent-derived lanes (#109) was reviewed and not built:
+`docs/first-call-registration.md`.
+
+The triggers, as read at each review:
+- *Misdelivery.* Read `job_notices.other_instance_by_suffix`. `suffix_equal`
+  is consistent with a relaunch of the conversation the lane was derived from,
+  not proof of one (an explicit label can carry any suffix); trace every
+  `suffix_differs`, `no_suffix` and `conversation_unrecorded` id, and check a
+  `suffix_equal` lane was not explicitly labelled. A conversation that claimed
+  the lane is not by itself benign: taking a lane over is the case under study.
+  Baseline 2026-10-13: 3 of 128 acked notices `other_instance`, all a relaunch
+  of the dispatching conversation; 0 `same_instance`, 125 `unknown` (acked
+  before acks were recorded). 2026-10-15: 20 `other_instance`, all
+  `suffix_equal` on derived Claude lanes.
+- *Legacy writers retired.* Holds since 2026-10-13: a precondition for a
+  recipient-format change, not a reason for one.
+- *Handover with jobs outstanding, contested names or the claim cap blocking
+  real claims.* From the sessions in use; `unread_mail` lanes whose `holder`
+  is `contested` are contested names with mail waiting. Baseline 2026-10-15:
+  75 unread, all on lanes with no registration, none contested.
+- *Codex wake routes.* `codex_routes` (#86): steered against queued and
+  ambiguous notices, and the reasons for queueing. Ambiguous ones should be
+  rare; a steady share of `no turn seen` means the turn id is not reaching
+  the wake. Read the totals against `codex_lane_servers_without_row`, whose
+  notices are in none: on 2026-10-15 it listed every live Codex-lane server, so
+  the totals covered nothing yet.
+- *A Codex thread as the address.* The strongest candidate yet for a stable
+  instance address: per thread, it survives reconnect and resume, and the client
+  supplies it. A first design was reviewed and not built; its findings
+  (UUIDv7 prefixes collide, subagent results, the identity hook's contract) are
+  on #90. A subagent's server holds a lane that attracts mail it never
+  announces (#109). One that has called hardline is marked `not_top_level`
+  and listed under `stalled_wakes.not_top_level`. One that never calls is
+  still indistinguishable from a session not yet called (`unwatched`).
+
+2026-10-27: `other_instance` 20 (unchanged, all `suffix_equal`),
+`same_instance` 166, nothing contested, no legacy writers, routes 83 queued
+and 0 steered (every TUI is embedded), nothing stalled.
+
+## Known limits, each a deliberate trade
+
+**A record without a creation token is honoured on pid liveness alone.** Every
+platform reads one now (macOS since #69), but rows written before that, or
+whose token would not read, let a reused pid pass for its process: they can
+keep a lane held or a job looking owned, which refuses rather than steals. They
+age out with the processes that wrote them; `hardline-mcp report` counts the
+ones still in force under `tokenless`, with unfinished jobs' children, whose
+cancel kills on the pid alone.
+
+**A cancelled or unsubmittable job's refused write is outside the admission
+bound.** Its slot is freed before the write is kept as a debt (#72's bound
+covers only a finished job's result). Needs a store refusing those writes
+repeatedly to matter.
+
+## Shipped since this list was written
+
+- Session-to-session mail watched working on the real store, Claude to Codex
+  and Claude to Claude (see "Not yet verified live" in `CLAUDE.md`).
+- The mutation harness and an isolated test store (#25): `scripts/mutate.py`,
+  `tests/mutations/`, run in CI.
+- Process-instance binding (#29): job owners carry `owner_key`, and a session
+  whose launching host exited is dead, so an orphaned server no longer holds
+  its lane.
+- Async Codex from Claude across an MCP reconnect, watched live (#32), and
+  `server_info().agent_commands` naming the executable a spawn runs (#33).
+- Ownership no longer reads the pre-`agent_sessions` registry: no process can
+  still write it (see "Retiring the legacy registry" in
+  `docs/architecture.md`).
+- `claim` probes holders and job owners before it reserves the single writer,
+  reusing inside only answers that refuse.

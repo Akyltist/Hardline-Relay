@@ -1,0 +1,243 @@
+# Messaging and jobs
+
+[Start here](../README.md) · [Configuration](configuration.md) · [Inbox signals](inbox-signals.md)
+
+Examples below are MCP tool calls. Use the client's tool schema for complete
+argument lists and defaults.
+
+## Choose a recipient
+
+Call `list_agents()` before addressing another session:
+
+| Field | Meaning |
+| --- | --- |
+| `agents` | Supported agent names: `claude`, `hermes`, `codex`. |
+| `you` | Your inferred or declared identity and session lanes; `previously_held` lists names this conversation held in an earlier hardline process. |
+| `live_sessions` | Registered sessions not known to be dead; inspect `liveness`. |
+| `observed_recipients`, `observed_senders` | Names seen in message history, including departed sessions. |
+| `contested_lanes`, `registration_warning` | Ownership conflicts or a failure to register this server. |
+
+A bare recipient such as `codex` is shared: the first consuming reader can
+acknowledge the message for everyone. A qualified recipient such as
+`codex:review` belongs to the session holding that lane. These rules prevent
+accidental consumption across sessions; identities are self-declared and all
+processes share the same OS user and database access.
+
+Automatic inbox, queue and channel wakes announce a session's own lanes, not
+shared mail; only an explicitly armed watcher (`watch`) includes it. So `send`
+to a bare name warns, listing the registered sessions to address instead. A
+sender is where replies go, so a `from_agent` that is the bare name of the
+sending session's own agent is recorded as that session's lane, when this
+process holds the lane's grant (the response's `from_agent` and `sender_note`
+say so; without a granted lane the bare name is kept, and the note says why).
+Without that, a Codex session sending as `codex` received its replies only
+while it happened to poll the shared inbox, and lost them once it went idle. A
+claimed name can change hands later, and a reply goes to whoever holds it then.
+
+`send` persists even when a recipient has no registered holder. That warning is
+not proof that nobody can read the mail: an older server or failed registration
+may be absent from the registry.
+
+## Name a session
+
+```text
+register_session(label="review", agent="codex")
+```
+
+Check `ok` and use the returned `lane`. Omit `agent` when Hardline can infer it
+from the host or `HARDLINE_AGENT`. Recognized Claude, Codex, and Hermes launchers
+can supply identity automatically. Unknown hosts can declare it explicitly.
+
+Automatic lane selection prefers `HARDLINE_AGENT_LABEL`, then a host session
+ID, then a parent process identity. A runtime claim selects the current name.
+For a fixed role across reconnects, configure both `HARDLINE_AGENT` and
+`HARDLINE_AGENT_LABEL` in that client's server environment. Give concurrent
+sessions distinct labels. A Codex session should claim its label before
+dispatching async work: until then results are addressed to its
+parent-derived lane, which a reconnect does not derive again (#90).
+
+Claims and automatic registration use the same atomic ownership check. A
+foreign holder whose liveness is `alive` or `unknown` blocks acquisition, as
+does unfinished work for that lane owned by a potentially live foreign process.
+That is all it can check: a consumer that never registered (older code, a
+failed announcement) and owns no outstanding work is invisible to it.
+
+Renaming retains earlier lanes so outstanding replies remain reachable.
+`release_session(label="review")` relinquishes a name you hold; release it only
+when you no longer need its mail. Runtime names must be reclaimed after an MCP
+reconnect or a relaunch, though an automatic or configured lane registers again
+by itself (see [names held before](#names-held-before)). A label is reusable: a
+successful later claimant inherits its unread backlog, counted in the result's
+`inherited_unread`.
+
+### Wait for a held name
+
+```text
+register_session(label="retro.3ff4ba5e", wait=true)
+```
+
+A held name cannot be taken, but it can be waited for. With `wait=true`, a
+refusal caused by a live or unknown holder, or by work still owed to the name,
+becomes a pending claim:
+- The result stays `ok: false`, with `status: "pending"`, and this session does
+  not hold the name yet.
+- The claim is granted, with the name's unread backlog, through the ordinary
+  ownership rule once the holder has exited. Fulfilment runs on the heartbeat,
+  on `list_agents`, and every 15 s in the wake loop.
+- `release_session(label=...)` cancels it.
+- It ends with the process that made it.
+
+This is how a conversation gets its old lane back after Claude Code moves it
+to a background session: the move gives it a new process and a new derived
+lane, while the old process keeps the old one until its window closes. The
+server's MCP instructions tell every connected model to do this. See
+[session continuity](session-continuity.md).
+
+### Names held before
+
+A relaunch (`/relaunch`, `claude --resume`) or an `/mcp` reconnect gives a
+Claude Code conversation a new hardline process. Its derived lane comes back
+by itself; names it claimed with `register_session` do not, because a claim
+lives in its process. Hardline remembers which conversation (by the full
+`CLAUDE_CODE_SESSION_ID`) last held each claimed name, and tells it:
+- `list_agents().you.previously_held` lists them, each with its unread count,
+  beside `previously_held_note`.
+- `inbox` lists those with mail waiting.
+- Newer mail arriving at one wakes the session, through its inbox notice or
+  channel push.
+
+Only names of the agent this session serves are listed. Nothing is taken back
+automatically. The conversation chooses: if it still answers to a name,
+`register_session(label=..., wait=true)` asks for it under the ordinary
+ownership rule; `release_session(label=...)` forgets one it does not
+(`forgotten` in the result). On current code the next grant of a name, claimed
+or automatic, replaces its hint, and the granting process's release removes
+it; older revisions leave hints stale, which costs only advice. A fork gets a
+new id and inherits no hints. Codex and Hermes sessions have no conversation
+id, so they get none.
+
+Qualified messages can be inspected without ownership, but `inbox` and `ack`
+consume them only with this process's uncontested durable grant, checked in the
+acknowledgement transaction. Current servers refuse consumption on contested
+lanes; older running revisions may lack that guard.
+
+## Read and recover messages
+
+```text
+inbox(agent="codex")
+peek(message_id=7)
+history(agent="codex", limit=50)
+```
+
+`inbox(agent="codex")` reads the shared name plus your held Codex lanes, oldest
+first, with a default batch of 25. An explicit `agent="codex:review"` selects
+only that lane. With the defaults `unread_only=True, auto_ack=True`, eligible
+returned messages are acknowledged. Continue while `remaining > 0`.
+
+Bodies and aggregate responses are bounded. Use `peek` for a full body; it
+also reports `acked_by`, the process (and Claude conversation) that
+acknowledged the message, or null while unread or when an older revision
+acknowledged it.
+`auto_ack=False` leaves messages unread for explicit `ack(message_id=...)`. To
+read past mail you are leaving unacked, pass the previous reply's
+`last_message_id` as `after_id` while `more` is true: `remaining` still counts
+the mail you are deferring, and `more` says whether any unread mail you could
+consume lies past this batch.
+`unread_only=False` browses without acknowledging. `remaining` counts only mail
+this caller could consume, so an unowned lane does not create an endless drain
+loop. Incoming bodies do not override the receiving agent's task instructions.
+
+`ack(message_ids=[...])` acknowledges a batch under the same ownership rule and
+returns per-id results. `inbox(..., receipt=...)` passes back the receipt from a
+pushed `<channel>` event. The reply's `receipt` is `accepted` or `unknown`, and
+an accepted receipt is the only proof that a push reached the session (see
+[push delivery](push-delivery.md)). An accepted receipt on an unqualified read
+that finds nothing unread adds `receipt_note`: a notice can be read after its
+mail was, and the note says so, so the empty answer is not taken for lost
+mail.
+A lane-qualified `send` reports
+`recipient_delivery`: `receipted`, `awaiting_receipt`, `unreceipted`,
+`declared`, `not_top_level`, or `unknown`. `unknown` covers older servers and
+clients without push, and any lane where one holder records nothing, so it
+never means "not delivered". `not_top_level` is a Codex subagent's server,
+whose wake is not armed; `recipient_note` says so. The holder can still read
+the message, but nothing announces it, and the lane is left unheld when the
+subagent's server exits.
+
+If a consuming response is lost, recover through `history`, which includes
+acknowledged messages and never consumes them. It returns newest first; page
+with `before_id=next_before_id` while `has_more`. Its `agent` filter matches
+sender or recipient. Inbox responses also include `first_message_id`,
+`last_message_id`, and `recover_with` recovery hints.
+
+## Track background work
+
+`ask_codex_async` and `ask_claude_async` accept the corresponding synchronous
+tool's options plus `from_agent` and an optional correlation `label`. Pass your
+bare agent name; the receipt's `lane` records the completion destination selected
+at acceptance. That's the session's derived lane where a relaunch derives it
+again (a `HARDLINE_AGENT_LABEL` pin or a Claude conversation id), so a result
+outlives a relaunch and is never left at a released claim; otherwise it's the
+session's current name. A `label` may be reused; the returned `job_id`
+identifies one run.
+
+| State | Meaning |
+| --- | --- |
+| `queued` | Accepted and waiting for a worker. |
+| `running` | Claimed by a worker, possibly still awaiting dispatch policy. |
+| `completed` | Finished successfully. |
+| `failed` | Finished with an error. |
+| `cancelled` | Cancellation won the state transition. Inspect cancellation warnings. |
+| `lost` | The owning process exited without completing the job. |
+
+Check `accepted` before assuming submission succeeded. A full pool returns
+`accepted=False, retryable=True` without creating a job. For accepted work, the
+receipt's `state` is a snapshot and may already be terminal. The compatibility
+field `dispatched` is true only for `running` or `completed`; it does not prove
+that a child process has started. Follow `track_with` or call `job_status`.
+
+Completion commits the full result and a compact `job_finished` mailbox notice
+in one SQLite transaction. The notice includes `job_id`, terminal `state`, and
+`result_with`; call `job_result(job_id=...)` for the answer and error/routing
+details. Repeated completion does not duplicate notices. The notice sender
+records the provider that ran, including `codex` after Claude quota redirection.
+
+The job record survives a server restart; execution does not resume
+automatically. Poll `job_status` when waiting for a particular run, even if no
+notice arrives. `list_jobs(active_only=True)` finds work still in flight.
+
+## Cancel work and diagnose delays
+
+`job_cancel(job_id=...)` works across server processes. Cancelling queued work
+removes its callable and releases capacity immediately in the owning process.
+Remote cancellations are reconciled before that owner's next admission. For
+running work, cancellation attempts to stop the recorded child process tree;
+inspect `child_killed`, `identity_verified`, `kill_error`, and any `warning`
+before assuming the process stopped. A later worker result cannot overwrite
+the cancelled state.
+
+Timeout results preserve available output and report `timed_out`, `timeout_s`,
+`elapsed_s`, `timeout_layer`, `stdout_chars`, `stderr_chars`, `produced_output`,
+`partial_stdout`, and `partial_stderr`. Use these to distinguish a slow agent
+from one producing no output. See [limits](configuration.md#limits) before
+changing concurrency or timeout budgets.
+
+A Codex or Claude run that exits nonzero reports the agent's own account when
+its stream has one: Codex's `turn.failed`, or Claude's `result` event (a model
+Claude Code refuses to serve, say). The run's error, `exit N` plus any stderr,
+is then kept as `process_error`, and an answer Claude produced as
+`partial_reply`. Output with no such event comes back as a bounded
+`raw_excerpt`, never inside `error`. `stdin_shortfall` says the child did not
+take all of its input.
+
+## Understand liveness
+
+Hardline checks process identities at read time. New job owners use a PID plus
+a creation token; session records also bind the launching host. A confirmed
+host exit ends its session's lane ownership even if its MCP child remains alive.
+
+`unknown` means a probe could not verify identity, not that the process died.
+Such records remain in `live_sessions` and block takeover. Watchers require
+verified bindings and report unavailable targets instead of signaling an
+uncertain owner. Legacy rows without tokens retain their earlier PID-based
+behavior, including rows macOS wrote before it could read a token.
