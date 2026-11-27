@@ -21,6 +21,7 @@ from mcp.server.fastmcp import FastMCP
 
 from experiments import mcp_loopback_client as client
 from experiments.lan_notice_loop import NoticeLoop
+from experiments.pilot_identity import is_pilot_identity
 
 
 _MAX_RESPONSE = 1024 * 1024
@@ -42,7 +43,7 @@ def _wake_configuration():
     match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})/notice", url or "")
     if (not match or not 1 <= int(match.group(1)) <= 65535
             or not re.fullmatch(r"[0-9a-f]{64}", token or "")
-            or lane not in {"pilot:remote", "pilot:berlin"}):
+            or not is_pilot_identity(lane)):
         raise RuntimeError("invalid pilot DSH wake configuration")
     return url, token, lane
 

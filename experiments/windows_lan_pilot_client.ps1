@@ -8,7 +8,10 @@ param(
 $ErrorActionPreference = 'Stop'
 try {
     $config = Get-Content -LiteralPath (Join-Path $CredentialDirectory 'client.json') -Raw | ConvertFrom-Json
-    if ($config.agent -cnotin @('pilot:local', 'pilot:remote', 'pilot:berlin')) { throw 'Invalid synthetic pilot agent' }
+    # Keep the full-match and reserved name rules in experiments/pilot_identity.py.
+    if (($config.agent -isnot [string]) -or ($config.agent -cnotmatch '\Apilot:[a-z][a-z0-9_]{1,47}\z') -or ($config.agent -ceq 'pilot:admin')) {
+        throw 'Invalid synthetic pilot agent'
+    }
     # An inherited lane is never authoritative; derive it from protected client.json.
     if ((Test-Path Env:HARDLINE_PILOT_DSH_WAKE_URL) -or (Test-Path Env:HARDLINE_PILOT_DSH_WAKE_TOKEN)) {
         $env:HARDLINE_PILOT_DSH_WAKE_LANE = [string]$config.agent

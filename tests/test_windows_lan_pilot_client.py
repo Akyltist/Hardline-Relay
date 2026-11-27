@@ -10,7 +10,10 @@ import pytest
 
 @pytest.mark.parametrize("agent, expected", [
     ("pilot:local", 0), ("pilot:remote", 0), ("pilot:berlin", 0),
-    ("pilot:Berlin", 1), ("pilot:berlin-other", 1),
+    ("pilot:new_member", 0), ("pilot:ab", 0), ("pilot:" + "a" * 48, 0),
+    ("pilot:Member", 1), ("pilot:new-member", 1), ("pilot:admin", 1),
+    ("codex:new_member", 1), ("pilot:new_member\n", 1), ("pilot:a", 1),
+    ("pilot:" + "a" * 49, 1), (["pilot:remote"], 1),
 ])
 def test_client_accepts_only_pilot_identities(tmp_path, agent, expected):
     shell = shutil.which("powershell")
@@ -36,8 +39,10 @@ def test_client_accepts_only_pilot_identities(tmp_path, agent, expected):
 @pytest.mark.parametrize("agent,enabled,expected_lane", [
     ("pilot:remote", True, "pilot:remote"),
     ("pilot:berlin", True, "pilot:berlin"),
+    ("pilot:new_member", True, "pilot:new_member"),
     ("pilot:local", False, "<unset>"),
     ("pilot:remote", False, "<unset>"),
+    ("pilot:new_member", False, "<unset>"),
 ])
 def test_wake_lane_comes_from_client_configuration(tmp_path, agent, enabled, expected_lane):
     shell = shutil.which("powershell")

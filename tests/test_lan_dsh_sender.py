@@ -28,13 +28,14 @@ def configured(monkeypatch, url=URL, token=TOKEN, lane="pilot:remote"):
     monkeypatch.setenv("HARDLINE_PILOT_DSH_WAKE_LANE", lane)
 
 
-@pytest.mark.parametrize("lane", ["pilot:remote", "pilot:berlin"])
+@pytest.mark.parametrize("lane", ["pilot:local", "pilot:remote", "pilot:berlin", "pilot:new_member"])
 def test_supported_wake_lanes(monkeypatch, lane):
     configured(monkeypatch, lane=lane)
     assert tls._wake_configuration() == (URL, TOKEN, lane)
 
 
-@pytest.mark.parametrize("lane", ["", "pilot:local", "pilot:Berlin", "pilot:remote ", "other"])
+@pytest.mark.parametrize("lane", ["", "pilot:Member", "pilot:remote ", "other", "pilot:admin",
+    "codex:new_member", "pilot:new_member\n", "pilot:" + "a" * 49])
 def test_invalid_lane_rejected(monkeypatch, lane):
     configured(monkeypatch, lane=lane)
     with pytest.raises(RuntimeError, match="invalid pilot DSH wake configuration"):
@@ -56,6 +57,10 @@ def test_disabled_and_partial_configuration(monkeypatch):
         tls.create_test_mcp()
     monkeypatch.delenv("HARDLINE_PILOT_DSH_WAKE_URL")
     monkeypatch.setenv("HARDLINE_PILOT_DSH_WAKE_TOKEN", TOKEN)
+    with pytest.raises(RuntimeError):
+        tls.create_test_mcp()
+    monkeypatch.delenv("HARDLINE_PILOT_DSH_WAKE_TOKEN")
+    monkeypatch.setenv("HARDLINE_PILOT_DSH_WAKE_LANE", "pilot:new_member")
     with pytest.raises(RuntimeError):
         tls.create_test_mcp()
 
@@ -113,7 +118,7 @@ def test_http_failures_distinguish_unknown_outcome(monkeypatch, status, known):
             tls._post_wake(URL, TOKEN)
 
 
-@pytest.mark.parametrize("lane", ["pilot:remote", "pilot:berlin"])
+@pytest.mark.parametrize("lane", ["pilot:remote", "pilot:berlin", "pilot:new_member"])
 def test_paginated_inbox_shares_gateway_without_ack(monkeypatch, lane):
     calls = []
     notices = []
@@ -151,7 +156,7 @@ def test_wrong_credential_lane_cannot_wake_another_agent(monkeypatch):
         return True
 
     monkeypatch.setattr(tls.client, "gateway_call", gateway)
-    loop = NoticeLoop(lambda after_id: tls._read_pilot_unread(after_id, "pilot:berlin"), notify)
+    loop = NoticeLoop(lambda after_id: tls._read_pilot_unread(after_id, "pilot:new_member"), notify)
     with pytest.raises(RuntimeError, match="forbidden"):
         asyncio.run(loop.poll_once())
     assert notices == []
@@ -179,7 +184,7 @@ def test_mcp_lifecycle_starts_and_stops_same_process_poller(monkeypatch):
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("lane", ["pilot:remote", "pilot:berlin"])
+@pytest.mark.parametrize("lane", ["pilot:remote", "pilot:berlin", "pilot:new_member"])
 def test_lifespan_drives_gateway_to_receiver_without_real_network(monkeypatch, lane):
     configured(monkeypatch, lane=lane)
     delivered = Event()
